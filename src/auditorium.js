@@ -6,13 +6,13 @@ export function normalizeAuditorium(str) {
   return str
     .trim()
     .toLowerCase()
-    .replace(/^(?:ауд|аудитория|каб|кабинет)[.\s]*/i, '')
+    .replace(/^(?:аудитория|аудитории|ауд|кабинет|каб)[.\s]*/i, '')
     .replace(/[-_ ]/g, '');
 }
 
 export function cleanAuditoriumTitle(str) {
   if (!str) return '';
-  return str.trim().replace(/^(?:ауд|аудитория|каб|кабинет)[.\s]*/i, '').trim();
+  return str.trim().replace(/^(?:аудитория|аудитории|ауд|кабинет|каб)[.\s]*/i, '').trim();
 }
 
 export async function syncAuditoriumSchedule(dateBegin = null, dateEnd = null) {

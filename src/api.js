@@ -112,6 +112,7 @@ export function parseLessonName(rawName) {
 export async function search(query) {
   if (!query || query.trim().length === 0) return [];
   await directoryCache.init();
+  await ensureAuditoriumSchedule();
 
   const audMatches = searchAuditoriums(query);
   const localMatches = directoryCache.search(query);
@@ -177,14 +178,14 @@ export async function getSchedule(target, startDate, finishDate) {
   const dstart = startDate || formatDate(new Date());
   const dfinish = finishDate || dstart;
 
-  if (/^(?:ауд|аудитория|каб|кабинет)[.\s]*/i.test(cleanTarget) || cleanTarget.startsWith('Ауд.')) {
-    await ensureAuditoriumSchedule();
+  await ensureAuditoriumSchedule();
+
+  if (/^(?:аудитория|аудитории|ауд|кабинет|каб)[.\s]*/i.test(cleanTarget) || cleanTarget.startsWith('Ауд.')) {
     return getAuditoriumSchedule(cleanTarget, dstart, dfinish);
   }
 
   const audResults = searchAuditoriums(cleanTarget, 1);
   if (audResults.length > 0 && normalizeAuditorium(audResults[0].id) === normalizeAuditorium(cleanTarget)) {
-    await ensureAuditoriumSchedule();
     return getAuditoriumSchedule(audResults[0].id, dstart, dfinish);
   }
 

@@ -11,6 +11,8 @@ import {
 import { storage } from './storage.js';
 import { directoryCache } from './cache.js';
 import { scheduleWatcher } from './watcher.js';
+import { dbManager } from './db.js';
+import { fetchOfficialDirectory } from './crawler.js';
 
 const token = process.env.BOT_TOKEN;
 
@@ -42,7 +44,8 @@ function getProfileView(user) {
       ? 'Отключить уведомления'
       : 'Включить уведомления';
     keyboard.text(toggleBtnText, 'toggle_notifications').row();
-    keyboard.text('Изменить группу', 'profile_change_target');
+    keyboard.text('Изменить группу', 'profile_change_target').row();
+    keyboard.text('Сбросить группу', 'profile_reset');
   } else {
     keyboard.text('Выбрать группу', 'profile_change_target');
   }
@@ -64,8 +67,7 @@ function getMainMenuKeyboard(hasTarget = false) {
       .text('Мой профиль');
   } else {
     keyboard
-      .text('Поиск')
-      .text('Помощь');
+      .text('Поиск');
   }
   return keyboard.resized();
 }
@@ -117,8 +119,7 @@ bot.command('start', async (ctx) => {
     awaitingTargetChange.delete(ctx.from.id);
     awaitingSearch.delete(ctx.from.id);
     await ctx.reply(
-      `Текущая группа: <b>${user.target}</b>\n\n` +
-      `Выберите пункт меню или воспользуйтесь поиском:`,
+      `Текущая группа: <b>${user.target}</b>`,
       {
         parse_mode: 'HTML',
         reply_markup: getMainMenuKeyboard(true)
@@ -136,97 +137,6 @@ bot.command('start', async (ctx) => {
       }
     );
   }
-});
-
-bot.command('help', async (ctx) => {
-  await ctx.reply(
-    `<b>Справка</b>\n\n` +
-    `— Отправьте название группы (например: <code>Гб-821</code>), фамилию преподавателя или номер аудитории (например: <code>326</code>).\n` +
-    `— <b>На сегодня</b> — пары на сегодня\n` +
-    `— <b>На завтра</b> — пары на завтра\n` +
-    `— <b>На эту неделю</b> — пары с понедельника по воскресенье\n` +
-    `— <b>На след. неделю</b> — расписание следующей недели\n` +
-    `— <b>Мой профиль</b> — текущая группа и статус уведомлений\n` +
-    `— /aud [номер] — расписание в аудитории\n` +
-    `— /check — проверить изменения расписания прямо сейчас\n` +
-    `— /notify — переключить уведомления об изменениях\n` +
-    `— /reset — сбросить сохраненные данные.\n\n` +
-    `<b>Инлайн-режим:</b>\n` +
-    `Вы можете написать в любом чате <code>@${ctx.me.username} [группа/преподаватель/аудитория]</code>, чтобы отправить расписание прямо в переписку.`,
-    {
-      parse_mode: 'HTML',
-      reply_markup: getMainMenuKeyboard(true)
-    }
-  );
-});
-
-bot.command('search', async (ctx) => {
-  awaitingTargetChange.delete(ctx.from.id);
-  awaitingSearch.add(ctx.from.id);
-  return ctx.reply(
-    'Введите название группы, фамилию преподавателя или номер аудитории (например: <code>Гб-821</code>, <code>Гаврилов</code> или <code>326</code>):',
-    { parse_mode: 'HTML' }
-  );
-});
-
-bot.command(['aud', 'room'], async (ctx) => {
-  awaitingTargetChange.delete(ctx.from.id);
-  awaitingSearch.delete(ctx.from.id);
-  const query = ctx.match.trim();
-  if (!query) {
-    return ctx.reply('Укажите номер аудитории, например: <code>/aud 326</code>', { parse_mode: 'HTML' });
-  }
-  const target = query.startsWith('Ауд.') ? query : `Ауд. ${query}`;
-  const today = getTodayDate();
-  return sendScheduleToUser(ctx, target, today, today, 'today');
-});
-
-bot.command('check', async (ctx) => {
-  await storage.init();
-  const user = storage.getUser(ctx.from.id);
-  if (!user?.target) {
-    return ctx.reply('Сначала укажите группу или преподавателя.');
-  }
-
-  const statusMsg = await ctx.reply(`Проверка расписания для <b>${user.target}</b>...`, { parse_mode: 'HTML' });
-  try {
-    const res = await scheduleWatcher.checkTarget(user.target, bot);
-    await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
-    if (res.hasChanges) {
-      return ctx.reply('Обнаружены и отправлены изменения в расписании.');
-    } else {
-      return ctx.reply(`Изменений для <b>${user.target}</b> не обнаружено. Расписание актуально.`, { parse_mode: 'HTML' });
-    }
-  } catch (err) {
-    await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
-    return ctx.reply(`Ошибка при проверке: ${err.message}`);
-  }
-});
-
-bot.command('notify', async (ctx) => {
-  await storage.init();
-  const user = storage.getUser(ctx.from.id);
-  if (!user?.target) {
-    return ctx.reply('Сначала укажите группу.');
-  }
-
-  const newState = !user.notifications;
-  await storage.setNotifications(ctx.from.id, newState);
-  return ctx.reply(
-    `Уведомления об изменениях расписания для <b>${user.target}</b>: <b>${newState ? 'Включены' : 'Отключены'}</b>.`,
-    { parse_mode: 'HTML' }
-  );
-});
-
-bot.command('reset', async (ctx) => {
-  await storage.init();
-  awaitingTargetChange.delete(ctx.from.id);
-  awaitingSearch.delete(ctx.from.id);
-  await storage.clearUser(ctx.from.id);
-  await ctx.reply(
-    `Настройки сброшены. Введите группу:`,
-    { reply_markup: getMainMenuKeyboard(false) }
-  );
 });
 
 bot.callbackQuery(/^view:(today|tomorrow|thisweek|nextweek):(.+)$/, async (ctx) => {
@@ -307,6 +217,19 @@ bot.callbackQuery('profile_cancel_change', async (ctx) => {
   awaitingSearch.delete(ctx.from.id);
   await ctx.answerCallbackQuery({ text: 'Отменено' });
   await ctx.api.deleteMessage(ctx.chat.id, ctx.callbackQuery.message.message_id).catch(() => {});
+});
+
+bot.callbackQuery('profile_reset', async (ctx) => {
+  await storage.init();
+  awaitingTargetChange.delete(ctx.from.id);
+  awaitingSearch.delete(ctx.from.id);
+  await storage.clearUser(ctx.from.id);
+  await ctx.answerCallbackQuery({ text: 'Данные сброшены' });
+  await ctx.api.deleteMessage(ctx.chat.id, ctx.callbackQuery.message.message_id).catch(() => {});
+  await ctx.reply(
+    'Настройки сброшены. Введите название группы:',
+    { reply_markup: getMainMenuKeyboard(false) }
+  );
 });
 
 bot.callbackQuery(/^show:(.+):(.+)$/, async (ctx) => {
@@ -473,15 +396,6 @@ bot.on('message:text', async (ctx) => {
     });
   }
 
-  if (text === 'Помощь') {
-    awaitingTargetChange.delete(ctx.from.id);
-    awaitingSearch.delete(ctx.from.id);
-    return ctx.reply(
-      'Отправьте название группы, фамилию преподавателя или номер аудитории.\nДля сброса используйте /reset.',
-      { parse_mode: 'HTML' }
-    );
-  }
-
   const isChangingTarget = awaitingTargetChange.has(ctx.from.id) || (!user?.target && !awaitingSearch.has(ctx.from.id));
   awaitingSearch.delete(ctx.from.id);
   const statusMsg = await ctx.reply('Поиск...');
@@ -523,10 +437,10 @@ bot.on('message:text', async (ctx) => {
         const inlineKeyboard = new InlineKeyboard();
 
         for (const item of searchResults.slice(0, 8)) {
-          const prefix = item.type === 'Aud'
-            ? '[Ауд.]'
-            : (item.type === 'Prep' ? '[Преп.]' : '[Группа]');
-          inlineKeyboard.text(`${prefix} ${item.title}`, `show:${item.type}:${item.title}`).row();
+          const label = item.type === 'Aud'
+            ? `[Ауд.] ${item.id || item.title.replace(/^Ауд\.\s*/i, '')}`
+            : (item.type === 'Prep' ? `[Преп.] ${item.title}` : `[Группа] ${item.title}`);
+          inlineKeyboard.text(label, `show:${item.type}:${item.title}`).row();
         }
 
         return ctx.reply(
@@ -601,6 +515,14 @@ if (process.argv[1] && process.argv[1].endsWith('bot.js')) {
   await storage.init();
   await directoryCache.init();
   await scheduleWatcher.init();
+  await bot.api.deleteMyCommands().catch(() => {});
+
+  const dirCount = dbManager.db.prepare('SELECT count(*) as count FROM directory_items').get().count;
+  const audCount = dbManager.db.prepare('SELECT count(*) as count FROM auditorium_lessons').get().count;
+  if (dirCount === 0 || audCount === 0) {
+    console.log('Инициализация базы данных и аудиторий...');
+    await fetchOfficialDirectory().catch(err => console.error('Ошибка инициализации:', err.message));
+  }
   console.log('Запуск Telegram-бота...');
   bot.start({
     onStart: (botInfo) => {
