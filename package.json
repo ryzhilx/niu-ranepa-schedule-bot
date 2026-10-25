@@ -1,0 +1,25 @@
+{
+  "name": "niu-ranepa-schedule-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot and API parser for NIU RANEPA schedule (services.niu.ranepa.ru)",
+  "main": "src/bot.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/bot.js",
+    "dev": "node --watch src/bot.js",
+    "crawl": "node src/crawler.js"
+  },
+  "keywords": [
+    "ranepa",
+    "niu-ranepa",
+    "schedule",
+    "telegram-bot",
+    "parser"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "grammy": "^1.35.0"
+  }
+}

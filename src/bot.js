@@ -1,0 +1,614 @@
+import 'dotenv/config';
+import { Bot, Keyboard, InlineKeyboard } from 'grammy';
+import {
+  search,
+  getSchedule,
+  getTodayDate,
+  getTomorrowDate,
+  getWeekRange,
+  formatScheduleMessages
+} from './api.js';
+import { storage } from './storage.js';
+import { directoryCache } from './cache.js';
+import { scheduleWatcher } from './watcher.js';
+
+const token = process.env.BOT_TOKEN;
+
+if (!token) {
+  console.error('Не задан токен бота (BOT_TOKEN в файле .env)');
+}
+
+export const bot = new Bot(token || 'dummy_token');
+
+const awaitingTargetChange = new Set();
+const awaitingSearch = new Set();
+
+function getProfileView(user) {
+  const hasTarget = Boolean(user?.target);
+  let text = '<b>Мой профиль</b>\n\n';
+
+  if (hasTarget) {
+    const notifStatus = user.notifications !== false ? 'Включены' : 'Отключены';
+    text += `Текущая группа: <b>${user.target}</b>\n` +
+      `Уведомления об изменениях: <b>${notifStatus}</b>`;
+  } else {
+    text += 'Основная группа пока не выбрана.\n' +
+      'Выберите группу для быстрого доступа к расписанию и уведомлений.';
+  }
+
+  const keyboard = new InlineKeyboard();
+  if (hasTarget) {
+    const toggleBtnText = user.notifications !== false
+      ? 'Отключить уведомления'
+      : 'Включить уведомления';
+    keyboard.text(toggleBtnText, 'toggle_notifications').row();
+    keyboard.text('Изменить группу', 'profile_change_target');
+  } else {
+    keyboard.text('Выбрать группу', 'profile_change_target');
+  }
+
+  return { text, keyboard };
+}
+
+function getMainMenuKeyboard(hasTarget = false) {
+  const keyboard = new Keyboard();
+  if (hasTarget) {
+    keyboard
+      .text('На сегодня')
+      .text('На завтра')
+      .row()
+      .text('На эту неделю')
+      .text('На след. неделю')
+      .row()
+      .text('Поиск')
+      .text('Мой профиль');
+  } else {
+    keyboard
+      .text('Поиск')
+      .text('Помощь');
+  }
+  return keyboard.resized();
+}
+
+function getScheduleInlineKeyboard(target, currentView = 'today') {
+  const keyboard = new InlineKeyboard();
+  keyboard
+    .text('Сегодня', `view:today:${target}`)
+    .text('Завтра', `view:tomorrow:${target}`)
+    .row()
+    .text('Эта неделя', `view:thisweek:${target}`)
+    .text('След. неделя', `view:nextweek:${target}`)
+    .row()
+    .text('Обновить', `view:${currentView}:${target}`);
+  return keyboard;
+}
+
+async function sendScheduleToUser(ctx, target, startDate, endDate, viewType = 'today') {
+  const statusMsg = await ctx.reply('Загрузка расписания...');
+
+  try {
+    const scheduleResult = await getSchedule(target, startDate, endDate);
+    const messages = formatScheduleMessages(scheduleResult);
+
+    await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
+
+    for (let i = 0; i < messages.length; i++) {
+      const isLast = i === messages.length - 1;
+      await ctx.reply(messages[i], {
+        parse_mode: 'HTML',
+        reply_markup: isLast ? getScheduleInlineKeyboard(target, viewType) : undefined
+      });
+    }
+  } catch (err) {
+    console.error(`[getSchedule error for "${target}"]:`, err.message);
+    await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
+    await ctx.reply(
+      `<b>Не удалось получить расписание</b>\n\nПричина: ${err.message}`,
+      { parse_mode: 'HTML' }
+    );
+  }
+}
+
+bot.command('start', async (ctx) => {
+  await storage.init();
+  const user = storage.getUser(ctx.from.id);
+
+  if (user?.target) {
+    awaitingTargetChange.delete(ctx.from.id);
+    awaitingSearch.delete(ctx.from.id);
+    await ctx.reply(
+      `Текущая группа: <b>${user.target}</b>\n\n` +
+      `Выберите пункт меню или воспользуйтесь поиском:`,
+      {
+        parse_mode: 'HTML',
+        reply_markup: getMainMenuKeyboard(true)
+      }
+    );
+  } else {
+    awaitingTargetChange.add(ctx.from.id);
+    awaitingSearch.delete(ctx.from.id);
+    await ctx.reply(
+      `Расписание <b>НИУ РАНХиГС</b>.\n\n` +
+      `Отправьте название группы (например: <code>Гб-821</code>):`,
+      {
+        parse_mode: 'HTML',
+        reply_markup: getMainMenuKeyboard(false)
+      }
+    );
+  }
+});
+
+bot.command('help', async (ctx) => {
+  await ctx.reply(
+    `<b>Справка</b>\n\n` +
+    `— Отправьте название группы (например: <code>Гб-821</code>), фамилию преподавателя или номер аудитории (например: <code>326</code>).\n` +
+    `— <b>На сегодня</b> — пары на сегодня\n` +
+    `— <b>На завтра</b> — пары на завтра\n` +
+    `— <b>На эту неделю</b> — пары с понедельника по воскресенье\n` +
+    `— <b>На след. неделю</b> — расписание следующей недели\n` +
+    `— <b>Мой профиль</b> — текущая группа и статус уведомлений\n` +
+    `— /aud [номер] — расписание в аудитории\n` +
+    `— /check — проверить изменения расписания прямо сейчас\n` +
+    `— /notify — переключить уведомления об изменениях\n` +
+    `— /reset — сбросить сохраненные данные.\n\n` +
+    `<b>Инлайн-режим:</b>\n` +
+    `Вы можете написать в любом чате <code>@${ctx.me.username} [группа/преподаватель/аудитория]</code>, чтобы отправить расписание прямо в переписку.`,
+    {
+      parse_mode: 'HTML',
+      reply_markup: getMainMenuKeyboard(true)
+    }
+  );
+});
+
+bot.command('search', async (ctx) => {
+  awaitingTargetChange.delete(ctx.from.id);
+  awaitingSearch.add(ctx.from.id);
+  return ctx.reply(
+    'Введите название группы, фамилию преподавателя или номер аудитории (например: <code>Гб-821</code>, <code>Гаврилов</code> или <code>326</code>):',
+    { parse_mode: 'HTML' }
+  );
+});
+
+bot.command(['aud', 'room'], async (ctx) => {
+  awaitingTargetChange.delete(ctx.from.id);
+  awaitingSearch.delete(ctx.from.id);
+  const query = ctx.match.trim();
+  if (!query) {
+    return ctx.reply('Укажите номер аудитории, например: <code>/aud 326</code>', { parse_mode: 'HTML' });
+  }
+  const target = query.startsWith('Ауд.') ? query : `Ауд. ${query}`;
+  const today = getTodayDate();
+  return sendScheduleToUser(ctx, target, today, today, 'today');
+});
+
+bot.command('check', async (ctx) => {
+  await storage.init();
+  const user = storage.getUser(ctx.from.id);
+  if (!user?.target) {
+    return ctx.reply('Сначала укажите группу или преподавателя.');
+  }
+
+  const statusMsg = await ctx.reply(`Проверка расписания для <b>${user.target}</b>...`, { parse_mode: 'HTML' });
+  try {
+    const res = await scheduleWatcher.checkTarget(user.target, bot);
+    await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
+    if (res.hasChanges) {
+      return ctx.reply('Обнаружены и отправлены изменения в расписании.');
+    } else {
+      return ctx.reply(`Изменений для <b>${user.target}</b> не обнаружено. Расписание актуально.`, { parse_mode: 'HTML' });
+    }
+  } catch (err) {
+    await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
+    return ctx.reply(`Ошибка при проверке: ${err.message}`);
+  }
+});
+
+bot.command('notify', async (ctx) => {
+  await storage.init();
+  const user = storage.getUser(ctx.from.id);
+  if (!user?.target) {
+    return ctx.reply('Сначала укажите группу.');
+  }
+
+  const newState = !user.notifications;
+  await storage.setNotifications(ctx.from.id, newState);
+  return ctx.reply(
+    `Уведомления об изменениях расписания для <b>${user.target}</b>: <b>${newState ? 'Включены' : 'Отключены'}</b>.`,
+    { parse_mode: 'HTML' }
+  );
+});
+
+bot.command('reset', async (ctx) => {
+  await storage.init();
+  awaitingTargetChange.delete(ctx.from.id);
+  awaitingSearch.delete(ctx.from.id);
+  await storage.clearUser(ctx.from.id);
+  await ctx.reply(
+    `Настройки сброшены. Введите группу:`,
+    { reply_markup: getMainMenuKeyboard(false) }
+  );
+});
+
+bot.callbackQuery(/^view:(today|tomorrow|thisweek|nextweek):(.+)$/, async (ctx) => {
+  const viewType = ctx.match[1];
+  const target = ctx.match[2];
+
+  let startDate, endDate;
+  if (viewType === 'today') {
+    startDate = getTodayDate();
+    endDate = startDate;
+  } else if (viewType === 'tomorrow') {
+    startDate = getTomorrowDate();
+    endDate = startDate;
+  } else if (viewType === 'thisweek') {
+    const range = getWeekRange(new Date(), 0);
+    startDate = range.start;
+    endDate = range.finish;
+  } else if (viewType === 'nextweek') {
+    const range = getWeekRange(new Date(), 1);
+    startDate = range.start;
+    endDate = range.finish;
+  }
+
+  try {
+    const scheduleResult = await getSchedule(target, startDate, endDate);
+    const messages = formatScheduleMessages(scheduleResult);
+    const newText = messages[0];
+
+    await ctx.editMessageText(newText, {
+      parse_mode: 'HTML',
+      reply_markup: getScheduleInlineKeyboard(target, viewType)
+    });
+    await ctx.answerCallbackQuery();
+  } catch (err) {
+    if (err.message?.includes('message is not modified')) {
+      await ctx.answerCallbackQuery({ text: 'Расписание актуально' });
+    } else {
+      await ctx.answerCallbackQuery({ text: 'Ошибка обновления' });
+    }
+  }
+});
+
+bot.callbackQuery('toggle_notifications', async (ctx) => {
+  await storage.init();
+  const user = storage.getUser(ctx.from.id);
+  if (!user) return ctx.answerCallbackQuery('Пользователь не найден');
+
+  const newState = !user.notifications;
+  await storage.setNotifications(ctx.from.id, newState);
+  const updatedUser = storage.getUser(ctx.from.id);
+
+  const { text: profileText, keyboard } = getProfileView(updatedUser);
+
+  await ctx.editMessageText(profileText, {
+    parse_mode: 'HTML',
+    reply_markup: keyboard
+  }).catch(() => {});
+
+  await ctx.answerCallbackQuery(newState ? 'Уведомления включены' : 'Уведомления отключены');
+});
+
+bot.callbackQuery('profile_change_target', async (ctx) => {
+  awaitingTargetChange.add(ctx.from.id);
+  awaitingSearch.delete(ctx.from.id);
+  await ctx.answerCallbackQuery();
+  const cancelKeyboard = new InlineKeyboard().text('Отмена', 'profile_cancel_change');
+  await ctx.reply(
+    'Введите название группы (например: <code>Гб-821</code>):',
+    {
+      parse_mode: 'HTML',
+      reply_markup: cancelKeyboard
+    }
+  );
+});
+
+bot.callbackQuery('profile_cancel_change', async (ctx) => {
+  awaitingTargetChange.delete(ctx.from.id);
+  awaitingSearch.delete(ctx.from.id);
+  await ctx.answerCallbackQuery({ text: 'Отменено' });
+  await ctx.api.deleteMessage(ctx.chat.id, ctx.callbackQuery.message.message_id).catch(() => {});
+});
+
+bot.callbackQuery(/^show:(.+):(.+)$/, async (ctx) => {
+  const target = ctx.match[2];
+  await ctx.answerCallbackQuery();
+  const today = getTodayDate();
+  await sendScheduleToUser(ctx, target, today, today, 'today');
+});
+
+bot.on('callback_query:data', async (ctx) => {
+  await storage.init();
+  const data = ctx.callbackQuery.data;
+
+  if (data.startsWith('set_profile:') || data.startsWith('set:')) {
+    const [, type, target] = data.split(':');
+    if (type !== 'Group') {
+      return ctx.answerCallbackQuery({
+        text: 'В качестве профиля можно выбрать только учебную группу.',
+        show_alert: true
+      });
+    }
+
+    awaitingTargetChange.delete(ctx.from.id);
+    awaitingSearch.delete(ctx.from.id);
+
+    await storage.setUserTarget(ctx.from.id, target, 'Group');
+    await scheduleWatcher.seedTarget(target);
+    await ctx.answerCallbackQuery({ text: `Сохранено: ${target}` });
+
+    await ctx.reply(
+      `Основная группа сохранена: <b>${target}</b>`,
+      {
+        parse_mode: 'HTML',
+        reply_markup: getMainMenuKeyboard(true)
+      }
+    );
+
+    const today = getTodayDate();
+    await sendScheduleToUser(ctx, target, today, today, 'today');
+  }
+});
+
+bot.on('inline_query', async (ctx) => {
+  await storage.init();
+  await directoryCache.init();
+  const query = ctx.inlineQuery.query.trim();
+  const user = storage.getUser(ctx.from.id);
+
+  let targets = [];
+  if (query.length > 0) {
+    targets = (await search(query)).slice(0, 4);
+  } else if (user?.target) {
+    targets = [{ title: user.target, type: 'Group' }];
+  }
+
+  if (targets.length === 0) {
+    return ctx.answerInlineQuery([], {
+      cache_time: 5,
+      switch_pm_text: 'Введите группу, преподавателя или аудиторию',
+      switch_pm_parameter: 'search'
+    });
+  }
+
+  const results = [];
+  const today = getTodayDate();
+  const week = getWeekRange(new Date(), 0);
+
+  for (const t of targets.slice(0, 2)) {
+    try {
+      const todaySched = await getSchedule(t.title, today, today);
+      const todayMsgs = formatScheduleMessages(todaySched);
+
+      results.push({
+        type: 'article',
+        id: `${t.title}:today:${Date.now()}:${Math.random().toString(36).slice(2)}`,
+        title: `${t.title} — на сегодня`,
+        description: `Расписание на ${today}`,
+        input_message_content: {
+          message_text: todayMsgs[0],
+          parse_mode: 'HTML'
+        }
+      });
+
+      const weekSched = await getSchedule(t.title, week.start, week.finish);
+      const weekMsgs = formatScheduleMessages(weekSched);
+
+      results.push({
+        type: 'article',
+        id: `${t.title}:week:${Date.now()}:${Math.random().toString(36).slice(2)}`,
+        title: `${t.title} — на неделю`,
+        description: `${week.start} — ${week.finish}`,
+        input_message_content: {
+          message_text: weekMsgs[0],
+          parse_mode: 'HTML'
+        }
+      });
+    } catch {}
+  }
+
+  await ctx.answerInlineQuery(results, { cache_time: 0, is_personal: true });
+});
+
+bot.on('message:text', async (ctx) => {
+  await storage.init();
+  const text = ctx.message.text.trim();
+  const user = storage.getUser(ctx.from.id);
+
+  if (text === 'На сегодня') {
+    awaitingTargetChange.delete(ctx.from.id);
+    awaitingSearch.delete(ctx.from.id);
+    if (!user?.target) {
+      return ctx.reply('Сначала укажите группу в профиле.');
+    }
+    const today = getTodayDate();
+    return sendScheduleToUser(ctx, user.target, today, today, 'today');
+  }
+
+  if (text === 'На завтра') {
+    awaitingTargetChange.delete(ctx.from.id);
+    awaitingSearch.delete(ctx.from.id);
+    if (!user?.target) {
+      return ctx.reply('Сначала укажите группу в профиле.');
+    }
+    const tomorrow = getTomorrowDate();
+    return sendScheduleToUser(ctx, user.target, tomorrow, tomorrow, 'tomorrow');
+  }
+
+  if (text === 'На эту неделю') {
+    awaitingTargetChange.delete(ctx.from.id);
+    awaitingSearch.delete(ctx.from.id);
+    if (!user?.target) {
+      return ctx.reply('Сначала укажите группу в профиле.');
+    }
+    const { start, finish } = getWeekRange(new Date(), 0);
+    return sendScheduleToUser(ctx, user.target, start, finish, 'thisweek');
+  }
+
+  if (text === 'На след. неделю') {
+    awaitingTargetChange.delete(ctx.from.id);
+    awaitingSearch.delete(ctx.from.id);
+    if (!user?.target) {
+      return ctx.reply('Сначала укажите группу в профиле.');
+    }
+    const { start, finish } = getWeekRange(new Date(), 1);
+    return sendScheduleToUser(ctx, user.target, start, finish, 'nextweek');
+  }
+
+  if (text === 'Поиск' || text === 'Найти / Сменить' || text === 'Найти группу или преподавателя' || text === 'Поиск аудитории') {
+    awaitingTargetChange.delete(ctx.from.id);
+    awaitingSearch.add(ctx.from.id);
+    return ctx.reply(
+      'Введите название группы, фамилию преподавателя или номер аудитории (например: <code>Гб-821</code>, <code>Гаврилов</code> или <code>326</code>):',
+      { parse_mode: 'HTML' }
+    );
+  }
+
+  if (text === 'Мой профиль') {
+    awaitingTargetChange.delete(ctx.from.id);
+    awaitingSearch.delete(ctx.from.id);
+    const { text: profileText, keyboard } = getProfileView(user);
+    return ctx.reply(profileText, {
+      parse_mode: 'HTML',
+      reply_markup: keyboard
+    });
+  }
+
+  if (text === 'Помощь') {
+    awaitingTargetChange.delete(ctx.from.id);
+    awaitingSearch.delete(ctx.from.id);
+    return ctx.reply(
+      'Отправьте название группы, фамилию преподавателя или номер аудитории.\nДля сброса используйте /reset.',
+      { parse_mode: 'HTML' }
+    );
+  }
+
+  const isChangingTarget = awaitingTargetChange.has(ctx.from.id) || (!user?.target && !awaitingSearch.has(ctx.from.id));
+  awaitingSearch.delete(ctx.from.id);
+  const statusMsg = await ctx.reply('Поиск...');
+
+  try {
+    const searchResults = await search(text);
+
+    if (searchResults && searchResults.length > 0) {
+      if (isChangingTarget) {
+        const profileResults = searchResults.filter(item => item.type === 'Group');
+
+        if (profileResults.length === 0 && searchResults.some(item => item.type === 'Aud' || item.type === 'Prep')) {
+          await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
+          return ctx.reply(
+            'В качестве профиля можно выбрать только учебную группу.\n\n' +
+            'Введите название группы (например: <code>Гб-821</code>):',
+            { parse_mode: 'HTML' }
+          );
+        }
+
+        if (profileResults.length > 0) {
+          await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
+          const inlineKeyboard = new InlineKeyboard();
+
+          for (const item of profileResults.slice(0, 8)) {
+            inlineKeyboard.text(`[Группа] ${item.title}`, `set_profile:Group:${item.title}`).row();
+          }
+
+          return ctx.reply(
+            `Найдено групп: <b>${profileResults.length}</b>. Выберите для сохранения в профиль:`,
+            {
+              parse_mode: 'HTML',
+              reply_markup: inlineKeyboard
+            }
+          );
+        }
+      } else {
+        await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
+        const inlineKeyboard = new InlineKeyboard();
+
+        for (const item of searchResults.slice(0, 8)) {
+          const prefix = item.type === 'Aud'
+            ? '[Ауд.]'
+            : (item.type === 'Prep' ? '[Преп.]' : '[Группа]');
+          inlineKeyboard.text(`${prefix} ${item.title}`, `show:${item.type}:${item.title}`).row();
+        }
+
+        return ctx.reply(
+          `Найдено совпадений: <b>${searchResults.length}</b>. Выберите вариант:`,
+          {
+            parse_mode: 'HTML',
+            reply_markup: inlineKeyboard
+          }
+        );
+      }
+    }
+
+    const today = getTodayDate();
+    const testRange = getWeekRange(new Date(), 0);
+    const scheduleCheck = await getSchedule(text, testRange.start, testRange.finish);
+
+    await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
+
+    if (scheduleCheck.targetType !== 'Unknown' || scheduleCheck.totalLessons > 0) {
+      const type = scheduleCheck.targetType || 'Group';
+
+      if (isChangingTarget) {
+        if (type !== 'Group') {
+          return ctx.reply(
+            'В качестве профиля можно выбрать только учебную группу.\n\n' +
+            'Введите название группы (например: <code>Гб-821</code>):',
+            { parse_mode: 'HTML' }
+          );
+        }
+
+        awaitingTargetChange.delete(ctx.from.id);
+        await storage.setUserTarget(ctx.from.id, text, 'Group');
+        await scheduleWatcher.seedTarget(text);
+
+        await ctx.reply(
+          `Основная группа сохранена: <b>${text}</b>`,
+          {
+            parse_mode: 'HTML',
+            reply_markup: getMainMenuKeyboard(true)
+          }
+        );
+      }
+
+      return sendScheduleToUser(ctx, text, today, today, 'today');
+    }
+
+    return ctx.reply(
+      `По запросу «<b>${text}</b>» ничего не найдено.\n\n` +
+      `Проверьте правильность написания группы (например: <code>Гб-821</code>), фамилии преподавателя или номера аудитории.`,
+      { parse_mode: 'HTML' }
+    );
+  } catch (err) {
+    console.error('[search/verification error]:', err.message);
+    await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
+    return ctx.reply(
+      `Ошибка: ${err.message}`,
+      { reply_markup: getMainMenuKeyboard(Boolean(user?.target)) }
+    );
+  }
+});
+
+bot.catch((err) => {
+  console.error('[bot error]:', err);
+});
+
+if (process.argv[1] && process.argv[1].endsWith('bot.js')) {
+  if (!token || token === 'dummy_token') {
+    console.error('Запуск невозможен: укажите BOT_TOKEN в файле .env');
+    process.exit(1);
+  }
+
+  await storage.init();
+  await directoryCache.init();
+  await scheduleWatcher.init();
+  console.log('Запуск Telegram-бота...');
+  bot.start({
+    onStart: (botInfo) => {
+      console.log(`Бот @${botInfo.username} запущен.`);
+      const intervalMin = process.env.CHECK_INTERVAL_MINUTES
+        ? parseInt(process.env.CHECK_INTERVAL_MINUTES, 10)
+        : 10;
+      scheduleWatcher.start(bot, intervalMin);
+    }
+  });
+}

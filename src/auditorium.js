@@ -1,0 +1,214 @@
+import { dbManager } from './db.js';
+import { getTodayDate, getWeekRange, parseDate, WEEKDAYS } from './api.js';
+
+export function normalizeAuditorium(str) {
+  if (!str) return '';
+  return str
+    .trim()
+    .toLowerCase()
+    .replace(/^(?:ауд|аудитория|каб|кабинет)[.\s]*/i, '')
+    .replace(/[-_ ]/g, '');
+}
+
+export function cleanAuditoriumTitle(str) {
+  if (!str) return '';
+  return str.trim().replace(/^(?:ауд|аудитория|каб|кабинет)[.\s]*/i, '').trim();
+}
+
+export async function syncAuditoriumSchedule(dateBegin = null, dateEnd = null) {
+  dbManager.init();
+
+  const dstart = dateBegin || getWeekRange(new Date(), 0).start;
+  const dfinish = dateEnd || getWeekRange(new Date(), 1).finish;
+
+  const listRes = await fetch('http://services.niu.ranepa.ru/API/public/teacher/teachersAndGroupsList');
+  if (!listRes.ok) {
+    throw new Error(`teachersAndGroupsList HTTP ${listRes.status}`);
+  }
+
+  const all = await listRes.json();
+  const groups = all.filter(i => i.type === '0' && i.oid);
+
+  const insertStmt = dbManager.db.prepare(`
+    INSERT OR REPLACE INTO auditorium_lessons 
+    (auditorium, normalized_auditorium, date, date_val, start_time, end_time, subject, type, teacher, group_name)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  const chunkSize = 25;
+  let count = 0;
+
+  dbManager.db.exec('BEGIN TRANSACTION;');
+
+  try {
+    for (let i = 0; i < groups.length; i += chunkSize) {
+      const chunk = groups.slice(i, i + chunkSize);
+      const chunkPromises = chunk.map(g => {
+        return fetch('http://services.niu.ranepa.ru/API/public/group/getSchedule', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({ id: g.oid, dateBegin: dstart, dateEnd: dfinish }).toString()
+        })
+        .then(r => r.json().then(list => ({ group: g.value, list })))
+        .catch(() => ({ group: g.value, list: [] }));
+      });
+
+      const chunkResults = await Promise.all(chunkPromises);
+      for (const { group, list } of chunkResults) {
+        if (!Array.isArray(list)) continue;
+        for (const item of list) {
+          const aud = (item.number || '').trim();
+          if (!aud) continue;
+
+          let dateStr = item.xdt || '';
+          if (dateStr.includes(' ')) {
+            const [dPart] = dateStr.split(' ');
+            const [y, m, d] = dPart.split('-');
+            dateStr = `${d}.${m}.${y}`;
+          }
+
+          const [d, m, y] = dateStr.split('.').map(Number);
+          const dateVal = y * 10000 + m * 100 + d;
+          const normAud = normalizeAuditorium(aud);
+
+          insertStmt.run(
+            aud,
+            normAud,
+            dateStr,
+            dateVal,
+            item.nf || '',
+            item.kf || '',
+            item.subject || '',
+            item.type || '',
+            item.teacher || '',
+            group
+          );
+          count++;
+        }
+      }
+    }
+
+    dbManager.db.prepare('INSERT OR REPLACE INTO directory_meta (key, value) VALUES (?, ?)').run(
+      'lastAuditoriumSync',
+      new Date().toISOString()
+    );
+
+    dbManager.db.exec('COMMIT;');
+  } catch (err) {
+    dbManager.db.exec('ROLLBACK;');
+    throw err;
+  }
+
+  return { totalLessons: count };
+}
+
+export async function ensureAuditoriumSchedule() {
+  dbManager.init();
+  const countRow = dbManager.db.prepare('SELECT count(*) as count FROM auditorium_lessons').get();
+  if (countRow.count === 0) {
+    await syncAuditoriumSchedule();
+  }
+}
+
+export function searchAuditoriums(query, limit = 8) {
+  if (!query) return [];
+  dbManager.init();
+
+  const norm = normalizeAuditorium(query);
+  if (!norm) return [];
+
+  const rows = dbManager.db.prepare(`
+    SELECT DISTINCT auditorium
+    FROM auditorium_lessons
+    WHERE normalized_auditorium LIKE ?
+    ORDER BY CASE WHEN normalized_auditorium = ? THEN 1 WHEN normalized_auditorium LIKE ? THEN 2 ELSE 3 END, auditorium
+    LIMIT ?
+  `).all(`%${norm}%`, norm, `${norm}%`, limit);
+
+  return rows.map(r => ({
+    type: 'Aud',
+    title: `Ауд. ${r.auditorium}`,
+    id: r.auditorium
+  }));
+}
+
+export function getAuditoriumSchedule(auditoriumQuery, startDate, endDate) {
+  dbManager.init();
+
+  const audClean = cleanAuditoriumTitle(auditoriumQuery);
+  const normAud = normalizeAuditorium(audClean);
+
+  const dstart = startDate || getTodayDate();
+  const dfinish = endDate || dstart;
+
+  const [sd, sm, sy] = dstart.split('.').map(Number);
+  const startVal = sy * 10000 + sm * 100 + sd;
+
+  const [fd, fm, fy] = dfinish.split('.').map(Number);
+  const finishVal = fy * 10000 + fm * 100 + fd;
+
+  const rows = dbManager.db.prepare(`
+    SELECT auditorium, date, date_val, start_time, end_time, subject, type, teacher, group_name
+    FROM auditorium_lessons
+    WHERE normalized_auditorium = ? AND date_val >= ? AND date_val <= ?
+    ORDER BY date_val, start_time
+  `).all(normAud, startVal, finishVal);
+
+  const officialAud = rows[0]?.auditorium || audClean;
+
+  const byDateMap = new Map();
+
+  for (const r of rows) {
+    if (!byDateMap.has(r.date)) {
+      byDateMap.set(r.date, new Map());
+    }
+    const dayMap = byDateMap.get(r.date);
+    const timeKey = `${r.start_time}-${r.end_time}-${r.subject}-${r.teacher}`;
+
+    if (!dayMap.has(timeKey)) {
+      dayMap.set(timeKey, {
+        date: r.date,
+        startTime: r.start_time,
+        endTime: r.end_time,
+        subject: r.subject,
+        type: r.type,
+        auditorium: r.auditorium,
+        teacher: r.teacher,
+        groups: [r.group_name],
+        group: r.group_name
+      });
+    } else {
+      const existing = dayMap.get(timeKey);
+      if (!existing.groups.includes(r.group_name)) {
+        existing.groups.push(r.group_name);
+        existing.group = existing.groups.join(', ');
+      }
+    }
+  }
+
+  const days = [];
+  for (const [dateStr, dayMap] of byDateMap.entries()) {
+    const dateObj = parseDate(dateStr);
+    const lessons = Array.from(dayMap.values()).sort((a, b) => a.startTime.localeCompare(b.startTime));
+    days.push({
+      date: dateStr,
+      dateObj,
+      dayOfWeek: WEEKDAYS[dateObj.getDay()] || '',
+      lessons
+    });
+  }
+
+  days.sort((a, b) => a.dateObj - b.dateObj);
+
+  const totalLessons = days.reduce((acc, d) => acc + d.lessons.length, 0);
+
+  return {
+    target: `Ауд. ${officialAud}`,
+    auditorium: officialAud,
+    targetType: 'Auditorium',
+    startDate: dstart,
+    endDate: dfinish,
+    totalLessons,
+    days
+  };
+}

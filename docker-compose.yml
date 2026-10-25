@@ -1,0 +1,12 @@
+services:
+  bot:
+    build: .
+    container_name: niu-ranepa-schedule-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=production
+      - TZ=Europe/Moscow
+    volumes:
+      - ./data:/app/data
