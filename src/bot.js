@@ -44,8 +44,7 @@ function getProfileView(user) {
       ? 'Отключить уведомления'
       : 'Включить уведомления';
     keyboard.text(toggleBtnText, 'toggle_notifications').row();
-    keyboard.text('Изменить группу', 'profile_change_target').row();
-    keyboard.text('Сбросить группу', 'profile_reset');
+    keyboard.text('Изменить группу', 'profile_change_target');
   } else {
     keyboard.text('Выбрать группу', 'profile_change_target');
   }
@@ -217,19 +216,6 @@ bot.callbackQuery('profile_cancel_change', async (ctx) => {
   awaitingSearch.delete(ctx.from.id);
   await ctx.answerCallbackQuery({ text: 'Отменено' });
   await ctx.api.deleteMessage(ctx.chat.id, ctx.callbackQuery.message.message_id).catch(() => {});
-});
-
-bot.callbackQuery('profile_reset', async (ctx) => {
-  await storage.init();
-  awaitingTargetChange.delete(ctx.from.id);
-  awaitingSearch.delete(ctx.from.id);
-  await storage.clearUser(ctx.from.id);
-  await ctx.answerCallbackQuery({ text: 'Данные сброшены' });
-  await ctx.api.deleteMessage(ctx.chat.id, ctx.callbackQuery.message.message_id).catch(() => {});
-  await ctx.reply(
-    'Настройки сброшены. Введите название группы:',
-    { reply_markup: getMainMenuKeyboard(false) }
-  );
 });
 
 bot.callbackQuery(/^show:(.+):(.+)$/, async (ctx) => {
