@@ -111,18 +111,26 @@ export function parseLessonName(rawName) {
 
 export async function search(query) {
   if (!query || query.trim().length === 0) return [];
+  const cleanQuery = query
+    .trim()
+    .replace(/^\[?(?:преподаватель|преподаватели|преподавателю|преп\.?|преп|учитель)\]?[.:\s]*/i, '')
+    .replace(/^\[?(?:группа|группы|группе|гр\.?|гр)\]?[.:\s]*/i, '')
+    .replace(/^\[?(?:аудитория|аудитории|аудиторию|ауд\.?|ауд|кабинет|каб\.?|каб)\]?[.:\s]*/i, '')
+    .trim();
+
+  if (!cleanQuery) return [];
+
   await directoryCache.init();
   await ensureAuditoriumSchedule();
 
-  const audMatches = searchAuditoriums(query);
-  const localMatches = directoryCache.search(query);
+  const audMatches = searchAuditoriums(cleanQuery);
+  const localMatches = directoryCache.search(cleanQuery);
 
   const combined = [...audMatches, ...localMatches];
   if (combined.length > 0) {
     return combined;
   }
 
-  const cleanQuery = query.trim();
   const url = `${BASE_URL}?name=${encodeURIComponent(cleanQuery)}`;
 
   try {
@@ -174,7 +182,11 @@ async function fetchMobileSchedule(endpoint, id, startDate, finishDate) {
 
 export async function getSchedule(target, startDate, finishDate) {
   if (!target) throw new Error('Target is required');
-  let cleanTarget = target.trim();
+  let cleanTarget = target
+    .trim()
+    .replace(/^\[?(?:преподаватель|преподаватели|преподавателю|преп\.?|преп|учитель)\]?[.:\s]*/i, '')
+    .replace(/^\[?(?:группа|группы|группе|гр\.?|гр)\]?[.:\s]*/i, '')
+    .trim();
   const dstart = startDate || formatDate(new Date());
   const dfinish = finishDate || dstart;
 

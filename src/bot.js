@@ -306,8 +306,7 @@ bot.on('inline_query', async (ctx) => {
         input_message_content: {
           message_text: todayMsgs[0],
           parse_mode: 'HTML'
-        },
-        reply_markup: getScheduleInlineKeyboard(t.title, 'today')
+        }
       });
 
       const weekSched = await getSchedule(t.title, week.start, week.finish);
@@ -321,15 +320,14 @@ bot.on('inline_query', async (ctx) => {
         input_message_content: {
           message_text: weekMsgs[0],
           parse_mode: 'HTML'
-        },
-        reply_markup: getScheduleInlineKeyboard(t.title, 'thisweek')
+        }
       });
     } catch (err) {
       console.error(`[inline_query error for ${t.title}]:`, err.message);
     }
   }
 
-  await ctx.answerInlineQuery(results, { cache_time: 10, is_personal: true }).catch(err => {
+  await ctx.answerInlineQuery(results, { cache_time: 0, is_personal: true }).catch(err => {
     console.error('[answerInlineQuery error]:', err.message);
   });
 });

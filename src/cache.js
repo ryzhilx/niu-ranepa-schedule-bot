@@ -19,9 +19,19 @@ class DirectoryCache {
     this.ensureInit();
   }
 
+  cleanPrefix(str) {
+    if (!str) return '';
+    return str
+      .trim()
+      .replace(/^\[?(?:преподаватель|преподаватели|преподавателю|преп\.?|преп|учитель)\]?[.:\s]*/i, '')
+      .replace(/^\[?(?:группа|группы|группе|гр\.?|гр)\]?[.:\s]*/i, '')
+      .replace(/^\[?(?:аудитория|аудитории|аудиторию|ауд\.?|ауд|кабинет|каб\.?|каб)\]?[.:\s]*/i, '')
+      .trim();
+  }
+
   addGroup(groupName) {
     if (!groupName) return;
-    const clean = groupName.trim();
+    const clean = this.cleanPrefix(groupName);
     if (clean && !this.groups.has(clean)) {
       this.groups.add(clean);
       this.ensureInit();
@@ -35,7 +45,7 @@ class DirectoryCache {
 
   addTeacher(title, id = null) {
     if (!title) return;
-    const clean = title.trim();
+    const clean = this.cleanPrefix(title);
     if (clean && !this.teachers.has(clean)) {
       this.teachers.set(clean, { title: clean, id: id ? Number(id) : null });
       this.ensureInit();
@@ -63,7 +73,9 @@ class DirectoryCache {
   getTeacher(title) {
     if (!title) return null;
     this.ensureInit();
-    const clean = title.trim();
+    const clean = this.cleanPrefix(title);
+    if (!clean) return null;
+
     if (this.teachers.has(clean)) {
       return this.teachers.get(clean);
     }
@@ -81,15 +93,13 @@ class DirectoryCache {
       return obj;
     }
 
-    const tokens = clean.toLowerCase().split(/[^a-zа-яё0-9]+/).filter(Boolean);
+    const stopWords = new Set(['преподаватель', 'преподаватели', 'преп', 'учитель']);
+    const tokens = clean.toLowerCase().split(/[^a-zа-яё0-9]+/).filter(t => t.length > 0 && !stopWords.has(t));
     if (tokens.length > 0) {
       const allPrep = dbManager.db.prepare("SELECT id, title, type FROM directory_items WHERE type = 'Prep'").all();
       const match = allPrep.find(t => {
         const words = t.title.toLowerCase().split(/\s+/);
-        return tokens.every((token, idx) => {
-          if (idx === 0) return words[0].includes(token);
-          return words.slice(1).some(w => w.startsWith(token));
-        });
+        return tokens.every(token => words.some(w => w.startsWith(token)));
       });
       if (match) {
         const obj = { title: match.title, id: match.id ? Number(match.id) : null };
@@ -104,7 +114,9 @@ class DirectoryCache {
   getGroup(title) {
     if (!title) return null;
     this.ensureInit();
-    const clean = title.trim();
+    const clean = this.cleanPrefix(title);
+    if (!clean) return null;
+
     if (this.groups.has(clean)) {
       return { title: clean, id: null };
     }
@@ -127,7 +139,9 @@ class DirectoryCache {
   search(query, limit = 8) {
     if (!query) return [];
     this.ensureInit();
-    const clean = query.trim();
+    const clean = this.cleanPrefix(query);
+    if (!clean) return [];
+
     const norm = clean.toLowerCase().replace(/[^a-zа-яё0-9]/gi, '');
 
     const rows = dbManager.db.prepare(`
@@ -147,15 +161,13 @@ class DirectoryCache {
       return results;
     }
 
-    const tokens = clean.toLowerCase().split(/[^a-zа-яё0-9]+/).filter(Boolean);
+    const stopWords = new Set(['преподаватель', 'преподаватели', 'преп', 'учитель', 'группа', 'ауд', 'аудитория']);
+    const tokens = clean.toLowerCase().split(/[^a-zа-яё0-9]+/).filter(t => t.length > 0 && !stopWords.has(t));
     if (tokens.length > 0) {
       const allPrep = dbManager.db.prepare("SELECT id, title, type FROM directory_items WHERE type = 'Prep'").all();
       const prepMatches = allPrep.filter(t => {
         const words = t.title.toLowerCase().split(/\s+/);
-        return tokens.every((token, idx) => {
-          if (idx === 0) return words[0].includes(token);
-          return words.slice(1).some(w => w.startsWith(token));
-        });
+        return tokens.every(token => words.some(w => w.startsWith(token)));
       }).slice(0, limit);
 
       return prepMatches.map(r => ({
