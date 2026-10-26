@@ -1,4 +1,5 @@
 import { directoryCache } from './cache.js';
+import { fetchWithTimeout } from './http.js';
 import {
   searchAuditoriums,
   getAuditoriumSchedule,
@@ -162,7 +163,7 @@ export async function search(query) {
 
 async function fetchMobileSchedule(endpoint, id, startDate, finishDate) {
   const url = `${MOBILE_API_BASE}/${endpoint}`;
-  const res = await fetch(url, {
+  const res = await fetchWithTimeout(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
@@ -237,15 +238,25 @@ export async function getSchedule(target, startDate, finishDate) {
             dateStr = `${d}.${m}.${y}`;
           }
 
+
+
+          let lessonType = item.type || '';
+          let lessonGroup = item.group || '';
+          if (targetType === 'Group' && !lessonGroup && lessonType.includes(',')) {
+            const commaIdx = lessonType.indexOf(',');
+            lessonGroup = lessonType.slice(commaIdx + 1).trim();
+            lessonType = lessonType.slice(0, commaIdx).trim();
+          }
+
           return {
             date: dateStr,
             startTime: item.nf || '',
             endTime: item.kf || '',
             subject: item.subject || '',
-            type: item.type || '',
+            type: lessonType,
             auditorium: item.number || '',
             teacher: item.teacher || '',
-            group: item.group || '',
+            group: lessonGroup,
             changeNote: null
           };
         })
@@ -289,7 +300,7 @@ export async function getSchedule(target, startDate, finishDate) {
   }
 
   const url = `${BASE_URL}?user=${encodeURIComponent(cleanTarget)}&dstart=${dstart}&dfinish=${dfinish}`;
-  const res = await fetch(url, {
+  const res = await fetchWithTimeout(url, {
     headers: { 'User-Agent': 'Mozilla/5.0 (Node.js NIU RANEPA Schedule Bot)' }
   });
 

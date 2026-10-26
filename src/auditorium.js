@@ -1,4 +1,5 @@
 import { dbManager } from './db.js';
+import { fetchWithTimeout } from './http.js';
 import { getTodayDate, getWeekRange, parseDate, WEEKDAYS } from './api.js';
 
 export function normalizeAuditorium(str) {
@@ -15,19 +16,88 @@ export function cleanAuditoriumTitle(str) {
   return str.trim().replace(/^(?:аудитория|аудитории|ауд|кабинет|каб)[.\s]*/i, '').trim();
 }
 
-export async function syncAuditoriumSchedule(dateBegin = null, dateEnd = null) {
+function parseXdtToDateVal(xdt) {
+  if (!xdt) return null;
+  let dateStr = xdt;
+  if (dateStr.includes(' ')) {
+    dateStr = dateStr.split(' ')[0];
+  }
+  let d, m, y;
+  if (dateStr.includes('-')) {
+    [y, m, d] = dateStr.split('-').map(Number);
+  } else if (dateStr.includes('.')) {
+    [d, m, y] = dateStr.split('.').map(Number);
+  } else {
+    return null;
+  }
+  if (!y || !m || !d || Number.isNaN(y) || Number.isNaN(m) || Number.isNaN(d)) {
+    return null;
+  }
+  const pad = (n) => String(n).padStart(2, '0');
+  return { dateStr: `${pad(d)}.${pad(m)}.${y}`, dateVal: y * 10000 + m * 100 + d };
+}
+
+export async function syncAuditoriumSchedule(dateBegin = null, dateEnd = null, groupsInput = null) {
   dbManager.init();
 
   const dstart = dateBegin || getWeekRange(new Date(), 0).start;
   const dfinish = dateEnd || getWeekRange(new Date(), 1).finish;
 
-  const listRes = await fetch('http://services.niu.ranepa.ru/API/public/teacher/teachersAndGroupsList');
-  if (!listRes.ok) {
-    throw new Error(`teachersAndGroupsList HTTP ${listRes.status}`);
+  let groups = groupsInput;
+  if (!groups) {
+    const listRes = await fetchWithTimeout('http://services.niu.ranepa.ru/API/public/teacher/teachersAndGroupsList');
+    if (!listRes.ok) {
+      throw new Error(`teachersAndGroupsList HTTP ${listRes.status}`);
+    }
+    const all = await listRes.json();
+    groups = all.filter(i => i.type === '0' && i.oid);
   }
 
-  const all = await listRes.json();
-  const groups = all.filter(i => i.type === '0' && i.oid);
+
+  const records = [];
+  const concurrency = 10;
+
+  for (let i = 0; i < groups.length; i += concurrency) {
+    const chunk = groups.slice(i, i + concurrency);
+    const chunkResults = await Promise.all(chunk.map(g =>
+      fetchWithTimeout('http://services.niu.ranepa.ru/API/public/group/getSchedule', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ id: g.oid, dateBegin: dstart, dateEnd: dfinish }).toString()
+      }, 20000)
+        .then(r => r.json().then(list => ({ group: g.value, list })))
+        .catch(() => ({ group: g.value, list: [] }))
+    ));
+
+    for (const { group, list } of chunkResults) {
+      if (!Array.isArray(list)) continue;
+      for (const item of list) {
+        const aud = (item.number || '').trim();
+        if (!aud) continue;
+
+        const parsed = parseXdtToDateVal(item.xdt);
+        if (!parsed) continue;
+
+        let itemType = item.type || '';
+        if (itemType.includes(',')) {
+          itemType = itemType.slice(0, itemType.indexOf(',')).trim();
+        }
+
+        records.push([
+          aud,
+          normalizeAuditorium(aud),
+          parsed.dateStr,
+          parsed.dateVal,
+          item.nf || '',
+          item.kf || '',
+          item.subject || '',
+          itemType,
+          item.teacher || '',
+          group
+        ]);
+      }
+    }
+  }
 
   const insertStmt = dbManager.db.prepare(`
     INSERT OR REPLACE INTO auditorium_lessons 
@@ -35,71 +105,22 @@ export async function syncAuditoriumSchedule(dateBegin = null, dateEnd = null) {
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
-  const chunkSize = 25;
-  let count = 0;
-
   dbManager.db.exec('BEGIN TRANSACTION;');
-
   try {
-    for (let i = 0; i < groups.length; i += chunkSize) {
-      const chunk = groups.slice(i, i + chunkSize);
-      const chunkPromises = chunk.map(g => {
-        return fetch('http://services.niu.ranepa.ru/API/public/group/getSchedule', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: new URLSearchParams({ id: g.oid, dateBegin: dstart, dateEnd: dfinish }).toString()
-        })
-        .then(r => r.json().then(list => ({ group: g.value, list })))
-        .catch(() => ({ group: g.value, list: [] }));
-      });
-
-      const chunkResults = await Promise.all(chunkPromises);
-      for (const { group, list } of chunkResults) {
-        if (!Array.isArray(list)) continue;
-        for (const item of list) {
-          const aud = (item.number || '').trim();
-          if (!aud) continue;
-
-          let dateStr = item.xdt || '';
-          if (dateStr.includes(' ')) {
-            const [dPart] = dateStr.split(' ');
-            const [y, m, d] = dPart.split('-');
-            dateStr = `${d}.${m}.${y}`;
-          }
-
-          const [d, m, y] = dateStr.split('.').map(Number);
-          const dateVal = y * 10000 + m * 100 + d;
-          const normAud = normalizeAuditorium(aud);
-
-          insertStmt.run(
-            aud,
-            normAud,
-            dateStr,
-            dateVal,
-            item.nf || '',
-            item.kf || '',
-            item.subject || '',
-            item.type || '',
-            item.teacher || '',
-            group
-          );
-          count++;
-        }
-      }
+    for (const rec of records) {
+      insertStmt.run(...rec);
     }
-
     dbManager.db.prepare('INSERT OR REPLACE INTO directory_meta (key, value) VALUES (?, ?)').run(
       'lastAuditoriumSync',
       new Date().toISOString()
     );
-
     dbManager.db.exec('COMMIT;');
   } catch (err) {
     dbManager.db.exec('ROLLBACK;');
     throw err;
   }
 
-  return { totalLessons: count };
+  return { totalLessons: records.length };
 }
 
 export async function ensureAuditoriumSchedule() {

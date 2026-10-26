@@ -1,4 +1,5 @@
 import { dbManager } from './db.js';
+import { fetchWithTimeout } from './http.js';
 import { syncAuditoriumSchedule } from './auditorium.js';
 import { directoryCache } from './cache.js';
 
@@ -9,8 +10,8 @@ export async function fetchOfficialDirectory() {
   console.log('Запрос официального справочника мобильного API...');
 
   const [listRes, verRes] = await Promise.all([
-    fetch(OFFICIAL_LIST_URL),
-    fetch(VERSION_URL).catch(() => null)
+    fetchWithTimeout(OFFICIAL_LIST_URL),
+    fetchWithTimeout(VERSION_URL).catch(() => null)
   ]);
 
   if (!listRes.ok) {
@@ -24,7 +25,8 @@ export async function fetchOfficialDirectory() {
   const teachers = new Map();
 
   for (const item of rawList) {
-    const title = item.value.trim();
+
+    const title = (item.value || '').trim();
     if (!title) continue;
 
     if (item.type === '1') {
@@ -80,7 +82,6 @@ export async function fetchOfficialDirectory() {
   console.log(`- Преподавателей: ${teachersArr.length}`);
   console.log(`- Групп: ${groupsArr.length}`);
 
-  console.log('Синхронизация расписания аудиторий...');
   const audRes = await syncAuditoriumSchedule();
   console.log(`- Занятий в аудиториях: ${audRes.totalLessons}`);
 

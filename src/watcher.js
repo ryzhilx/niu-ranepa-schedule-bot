@@ -8,6 +8,7 @@ import {
 } from './api.js';
 import { storage } from './storage.js';
 import { dbManager } from './db.js';
+import { makeRef } from './refs.js';
 
 export function diffLessonsForDay(oldLessons, newLessons) {
   const changes = [];
@@ -271,7 +272,7 @@ class ScheduleWatcher {
 
       if (bot) {
         const usersToNotify = storage.getUsersByTarget(target);
-        const keyboard = new InlineKeyboard().text('Посмотреть расписание', `view:today:${target}`);
+        const keyboard = new InlineKeyboard().text('Посмотреть расписание', `view:today:${makeRef('target', target)}`);
 
         for (const user of usersToNotify) {
           try {
@@ -305,16 +306,45 @@ class ScheduleWatcher {
     if (this.isChecking) return;
     this.isChecking = true;
 
+    const startedAt = Date.now();
+
     try {
       await storage.init();
       const activeTargets = storage.getActiveTargets();
       const results = [];
 
+      console.log(`[watcher] проверка запущена: целей ${activeTargets.length}`);
+
       for (const item of activeTargets) {
         const res = await this.checkTarget(item.target, bot);
         results.push(res);
+
+        if (res.success === false) {
+          console.log(`[watcher] ${item.target}: ошибка — ${res.error}`);
+        } else if (res.skipped) {
+          console.log(`[watcher] ${item.target}: пропущено (подозрительно пустое расписание)`);
+        } else if (res.seeded) {
+          console.log(`[watcher] ${item.target}: создан первичный снапшот`);
+        } else if (res.hasChanges) {
+          const dayCount = res.changesByDay?.length || 0;
+          const changeCount = (res.changesByDay || []).reduce((acc, d) => acc + d.changes.length, 0);
+          console.log(`[watcher] ${item.target}: изменения — дней ${dayCount}, правок ${changeCount}`);
+          for (const day of res.changesByDay || []) {
+            for (const c of day.changes) {
+              console.log(`[watcher]   ${day.date} ${c.time} ${c.type}: ${c.subject} (${c.details})`);
+            }
+          }
+        }
+
         await new Promise(resolve => setTimeout(resolve, 250));
       }
+
+      const changed = results.filter(r => r.hasChanges).length;
+      const failed = results.filter(r => r.success === false).length;
+      const durationMs = Date.now() - startedAt;
+      console.log(
+        `[watcher] проверка завершена за ${durationMs} мс: целей ${results.length}, с изменениями ${changed}, ошибок ${failed}`
+      );
 
       return results;
     } finally {

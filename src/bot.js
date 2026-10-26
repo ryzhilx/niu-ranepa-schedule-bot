@@ -14,6 +14,13 @@ import { directoryCache } from './cache.js';
 import { scheduleWatcher } from './watcher.js';
 import { dbManager } from './db.js';
 import { fetchOfficialDirectory } from './crawler.js';
+import { makeRef, resolveRef } from './refs.js';
+import { pending, PENDING_TARGET, PENDING_SEARCH } from './pendingState.js';
+
+function resolveTarget(code) {
+  const ref = resolveRef(code);
+  return ref ? ref.value : code;
+}
 
 const token = process.env.BOT_TOKEN;
 
@@ -23,8 +30,6 @@ if (!token) {
 
 export const bot = new Bot(token || 'dummy_token');
 
-const awaitingTargetChange = new Set();
-const awaitingSearch = new Set();
 
 function getProfileView(user) {
   const hasTarget = Boolean(user?.target);
@@ -73,15 +78,16 @@ function getMainMenuKeyboard(hasTarget = false) {
 }
 
 function getScheduleInlineKeyboard(target, currentView = 'today') {
+  const code = makeRef('target', target);
   const keyboard = new InlineKeyboard();
   keyboard
-    .text('Сегодня', `view:today:${target}`)
-    .text('Завтра', `view:tomorrow:${target}`)
+    .text('Сегодня', `view:today:${code}`)
+    .text('Завтра', `view:tomorrow:${code}`)
     .row()
-    .text('Эта неделя', `view:thisweek:${target}`)
-    .text('След. неделя', `view:nextweek:${target}`)
+    .text('Эта неделя', `view:thisweek:${code}`)
+    .text('След. неделя', `view:nextweek:${code}`)
     .row()
-    .text('Обновить', `view:${currentView}:${target}`);
+    .text('Обновить', `view:${currentView}:${code}`);
   return keyboard;
 }
 
@@ -116,8 +122,9 @@ bot.command('start', async (ctx) => {
   const user = storage.getUser(ctx.from.id);
 
   if (user?.target) {
-    awaitingTargetChange.delete(ctx.from.id);
-    awaitingSearch.delete(ctx.from.id);
+
+
+    pending.clear(ctx.from.id);
     await ctx.reply(
       `Текущая группа: <b>${user.target}</b>`,
       {
@@ -126,8 +133,6 @@ bot.command('start', async (ctx) => {
       }
     );
   } else {
-    awaitingTargetChange.add(ctx.from.id);
-    awaitingSearch.delete(ctx.from.id);
     await ctx.reply(
       `Расписание <b>НИУ РАНХиГС</b>.\n\n` +
       `Отправьте название группы (например: <code>Гб-821</code>):`,
@@ -141,7 +146,7 @@ bot.command('start', async (ctx) => {
 
 bot.callbackQuery(/^view:(today|tomorrow|thisweek|nextweek):(.+)$/, async (ctx) => {
   const viewType = ctx.match[1];
-  const target = ctx.match[2];
+  const target = resolveTarget(ctx.match[2]);
 
   let startDate, endDate;
   if (viewType === 'today') {
@@ -163,19 +168,34 @@ bot.callbackQuery(/^view:(today|tomorrow|thisweek|nextweek):(.+)$/, async (ctx) 
   try {
     const scheduleResult = await getSchedule(target, startDate, endDate);
     const messages = formatScheduleMessages(scheduleResult);
-    const newText = messages[0];
 
-    await ctx.editMessageText(newText, {
-      parse_mode: 'HTML',
-      reply_markup: getScheduleInlineKeyboard(target, viewType)
-    });
     await ctx.answerCallbackQuery();
-  } catch (err) {
-    if (err.message?.includes('message is not modified')) {
-      await ctx.answerCallbackQuery({ text: 'Расписание актуально' });
-    } else {
-      await ctx.answerCallbackQuery({ text: 'Ошибка обновления' });
+
+    if (messages.length === 1) {
+      try {
+        await ctx.editMessageText(messages[0], {
+          parse_mode: 'HTML',
+          reply_markup: getScheduleInlineKeyboard(target, viewType)
+        });
+      } catch (err) {
+        if (!err.message?.includes('message is not modified')) throw err;
+      }
+      return;
     }
+
+
+
+    await ctx.deleteMessage().catch(() => {});
+    for (let i = 0; i < messages.length; i++) {
+      const isLast = i === messages.length - 1;
+      await ctx.reply(messages[i], {
+        parse_mode: 'HTML',
+        reply_markup: isLast ? getScheduleInlineKeyboard(target, viewType) : undefined
+      });
+    }
+  } catch (err) {
+    console.error(`[view callback error for "${target}"]:`, err.message);
+    await ctx.answerCallbackQuery({ text: 'Ошибка обновления' }).catch(() => {});
   }
 });
 
@@ -199,9 +219,8 @@ bot.callbackQuery('toggle_notifications', async (ctx) => {
 });
 
 bot.callbackQuery('profile_change_target', async (ctx) => {
-  awaitingTargetChange.add(ctx.from.id);
-  awaitingSearch.delete(ctx.from.id);
-  await ctx.answerCallbackQuery();
+
+  pending.set(ctx.from.id, PENDING_TARGET);
   const cancelKeyboard = new InlineKeyboard().text('Отмена', 'profile_cancel_change');
   await ctx.reply(
     'Введите название группы (например: <code>Гб-821</code>):',
@@ -213,14 +232,13 @@ bot.callbackQuery('profile_change_target', async (ctx) => {
 });
 
 bot.callbackQuery('profile_cancel_change', async (ctx) => {
-  awaitingTargetChange.delete(ctx.from.id);
-  awaitingSearch.delete(ctx.from.id);
+  pending.clear(ctx.from.id);
   await ctx.answerCallbackQuery({ text: 'Отменено' });
   await ctx.api.deleteMessage(ctx.chat.id, ctx.callbackQuery.message.message_id).catch(() => {});
 });
 
 bot.callbackQuery(/^show:(.+):(.+)$/, async (ctx) => {
-  const target = ctx.match[2];
+  const target = resolveTarget(ctx.match[2]);
   await ctx.answerCallbackQuery();
   const today = getTodayDate();
   await sendScheduleToUser(ctx, target, today, today, 'today');
@@ -231,7 +249,8 @@ bot.on('callback_query:data', async (ctx) => {
   const data = ctx.callbackQuery.data;
 
   if (data.startsWith('set_profile:') || data.startsWith('set:')) {
-    const [, type, target] = data.split(':');
+    const [, type, rawTarget] = data.split(':');
+    const target = resolveTarget(rawTarget);
     if (type !== 'Group') {
       return ctx.answerCallbackQuery({
         text: 'В качестве профиля можно выбрать только учебную группу.',
@@ -239,8 +258,7 @@ bot.on('callback_query:data', async (ctx) => {
       });
     }
 
-    awaitingTargetChange.delete(ctx.from.id);
-    awaitingSearch.delete(ctx.from.id);
+    pending.clear(ctx.from.id);
 
     await storage.setUserTarget(ctx.from.id, target, 'Group');
     await scheduleWatcher.seedTarget(target);
@@ -338,8 +356,7 @@ bot.on('message:text', async (ctx) => {
   const user = storage.getUser(ctx.from.id);
 
   if (text === 'На сегодня') {
-    awaitingTargetChange.delete(ctx.from.id);
-    awaitingSearch.delete(ctx.from.id);
+    pending.clear(ctx.from.id);
     if (!user?.target) {
       return ctx.reply('Сначала укажите группу в профиле.');
     }
@@ -348,8 +365,7 @@ bot.on('message:text', async (ctx) => {
   }
 
   if (text === 'На завтра') {
-    awaitingTargetChange.delete(ctx.from.id);
-    awaitingSearch.delete(ctx.from.id);
+    pending.clear(ctx.from.id);
     if (!user?.target) {
       return ctx.reply('Сначала укажите группу в профиле.');
     }
@@ -358,8 +374,7 @@ bot.on('message:text', async (ctx) => {
   }
 
   if (text === 'На эту неделю') {
-    awaitingTargetChange.delete(ctx.from.id);
-    awaitingSearch.delete(ctx.from.id);
+    pending.clear(ctx.from.id);
     if (!user?.target) {
       return ctx.reply('Сначала укажите группу в профиле.');
     }
@@ -368,8 +383,7 @@ bot.on('message:text', async (ctx) => {
   }
 
   if (text === 'На след. неделю') {
-    awaitingTargetChange.delete(ctx.from.id);
-    awaitingSearch.delete(ctx.from.id);
+    pending.clear(ctx.from.id);
     if (!user?.target) {
       return ctx.reply('Сначала укажите группу в профиле.');
     }
@@ -378,8 +392,7 @@ bot.on('message:text', async (ctx) => {
   }
 
   if (text === 'Поиск' || text === 'Найти / Сменить' || text === 'Найти группу или преподавателя' || text === 'Поиск аудитории') {
-    awaitingTargetChange.delete(ctx.from.id);
-    awaitingSearch.add(ctx.from.id);
+    pending.set(ctx.from.id, PENDING_SEARCH);
     return ctx.reply(
       'Введите название группы, фамилию преподавателя или номер аудитории (например: <code>Гб-821</code>, <code>Гаврилов</code> или <code>326</code>):',
       { parse_mode: 'HTML' }
@@ -387,8 +400,7 @@ bot.on('message:text', async (ctx) => {
   }
 
   if (text === 'Мой профиль') {
-    awaitingTargetChange.delete(ctx.from.id);
-    awaitingSearch.delete(ctx.from.id);
+    pending.clear(ctx.from.id);
     const { text: profileText, keyboard } = getProfileView(user);
     return ctx.reply(profileText, {
       parse_mode: 'HTML',
@@ -396,8 +408,8 @@ bot.on('message:text', async (ctx) => {
     });
   }
 
-  const isChangingTarget = awaitingTargetChange.has(ctx.from.id) || (!user?.target && !awaitingSearch.has(ctx.from.id));
-  awaitingSearch.delete(ctx.from.id);
+  const isChangingTarget = pending.is(ctx.from.id, PENDING_TARGET) || (!user?.target && !pending.is(ctx.from.id, PENDING_SEARCH));
+  pending.clear(ctx.from.id);
   const statusMsg = await ctx.reply('Поиск...');
 
   try {
@@ -421,7 +433,7 @@ bot.on('message:text', async (ctx) => {
           const inlineKeyboard = new InlineKeyboard();
 
           for (const item of profileResults.slice(0, 8)) {
-            inlineKeyboard.text(`[Группа] ${item.title}`, `set_profile:Group:${item.title}`).row();
+            inlineKeyboard.text(`[Группа] ${item.title}`, `set_profile:Group:${makeRef('Group', item.title)}`).row();
           }
 
           return ctx.reply(
@@ -440,7 +452,7 @@ bot.on('message:text', async (ctx) => {
           const label = item.type === 'Aud'
             ? `[Ауд.] ${item.id || item.title.replace(/^Ауд\.\s*/i, '')}`
             : (item.type === 'Prep' ? `[Преп.] ${item.title}` : `[Группа] ${item.title}`);
-          inlineKeyboard.text(label, `show:${item.type}:${item.title}`).row();
+          inlineKeyboard.text(label, `show:${item.type}:${makeRef(item.type, item.title)}`).row();
         }
 
         return ctx.reply(
@@ -471,7 +483,7 @@ bot.on('message:text', async (ctx) => {
           );
         }
 
-        awaitingTargetChange.delete(ctx.from.id);
+        pending.clear(ctx.from.id);
         await storage.setUserTarget(ctx.from.id, text, 'Group');
         await scheduleWatcher.seedTarget(text);
 
@@ -524,13 +536,29 @@ if (process.argv[1] && process.argv[1].endsWith('bot.js')) {
 
   await directoryCache.init();
   await scheduleWatcher.init();
+
+  let shuttingDown = false;
+  const shutdown = async (signal) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`Получен ${signal}, останавливаемся...`);
+    try {
+      scheduleWatcher.stop();
+      await bot.stop().catch(() => {});
+    } finally {
+      try { dbManager.db.close(); } catch {}
+      process.exit(0);
+    }
+  };
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+
   console.log('Запуск Telegram-бота...');
   bot.start({
     onStart: (botInfo) => {
       console.log(`Бот @${botInfo.username} запущен.`);
-      const intervalMin = process.env.CHECK_INTERVAL_MINUTES
-        ? parseInt(process.env.CHECK_INTERVAL_MINUTES, 10)
-        : 10;
+      const parsed = parseInt(process.env.CHECK_INTERVAL_MINUTES, 10);
+      const intervalMin = Number.isFinite(parsed) && parsed > 0 ? parsed : 10;
       scheduleWatcher.start(bot, intervalMin);
     }
   });
