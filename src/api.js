@@ -174,7 +174,7 @@ async function fetchMobileSchedule(endpoint, id, startDate, finishDate) {
 
 export async function getSchedule(target, startDate, finishDate) {
   if (!target) throw new Error('Target is required');
-  const cleanTarget = target.trim();
+  let cleanTarget = target.trim();
   const dstart = startDate || formatDate(new Date());
   const dfinish = finishDate || dstart;
 
@@ -194,16 +194,17 @@ export async function getSchedule(target, startDate, finishDate) {
   let knownOid = null;
   let targetType = 'Unknown';
 
-  const teacherObj = directoryCache.teachers.get(cleanTarget);
+  const teacherObj = directoryCache.getTeacher(cleanTarget);
   if (teacherObj) {
     targetType = 'Prep';
+    cleanTarget = teacherObj.title;
     knownOid = teacherObj.id;
-  } else if (directoryCache.groups.has(cleanTarget)) {
-    targetType = 'Group';
-    const searchRes = directoryCache.search(cleanTarget, 1);
-    if (searchRes.length > 0 && searchRes[0].title === cleanTarget) {
-      targetType = searchRes[0].type;
-      knownOid = searchRes[0].id || null;
+  } else {
+    const groupObj = directoryCache.getGroup(cleanTarget);
+    if (groupObj) {
+      targetType = 'Group';
+      cleanTarget = groupObj.title;
+      knownOid = groupObj.id;
     }
   }
 

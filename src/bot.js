@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import crypto from 'crypto';
 import { Bot, Keyboard, InlineKeyboard } from 'grammy';
 import {
   search,
@@ -283,20 +284,30 @@ bot.on('inline_query', async (ctx) => {
   const today = getTodayDate();
   const week = getWeekRange(new Date(), 0);
 
-  for (const t of targets.slice(0, 2)) {
+  for (let idx = 0; idx < targets.length; idx++) {
+    const t = targets[idx];
+    const targetTitle = t.type === 'Aud'
+      ? (t.id || t.title.replace(/^Ауд\.\s*/i, ''))
+      : t.title;
+
+    const labelPrefix = t.type === 'Prep'
+      ? '[Преп.] '
+      : (t.type === 'Aud' ? '[Ауд.] ' : '[Группа] ');
+
     try {
       const todaySched = await getSchedule(t.title, today, today);
       const todayMsgs = formatScheduleMessages(todaySched);
 
       results.push({
         type: 'article',
-        id: `${t.title}:today:${Date.now()}:${Math.random().toString(36).slice(2)}`,
-        title: `${t.title} — на сегодня`,
+        id: crypto.createHash('md5').update(`today:${t.title}:${idx}`).digest('hex'),
+        title: `${labelPrefix}${targetTitle} — сегодня`,
         description: `Расписание на ${today}`,
         input_message_content: {
           message_text: todayMsgs[0],
           parse_mode: 'HTML'
-        }
+        },
+        reply_markup: getScheduleInlineKeyboard(t.title, 'today')
       });
 
       const weekSched = await getSchedule(t.title, week.start, week.finish);
@@ -304,18 +315,23 @@ bot.on('inline_query', async (ctx) => {
 
       results.push({
         type: 'article',
-        id: `${t.title}:week:${Date.now()}:${Math.random().toString(36).slice(2)}`,
-        title: `${t.title} — на неделю`,
+        id: crypto.createHash('md5').update(`week:${t.title}:${idx}`).digest('hex'),
+        title: `${labelPrefix}${targetTitle} — неделя`,
         description: `${week.start} — ${week.finish}`,
         input_message_content: {
           message_text: weekMsgs[0],
           parse_mode: 'HTML'
-        }
+        },
+        reply_markup: getScheduleInlineKeyboard(t.title, 'thisweek')
       });
-    } catch {}
+    } catch (err) {
+      console.error(`[inline_query error for ${t.title}]:`, err.message);
+    }
   }
 
-  await ctx.answerInlineQuery(results, { cache_time: 0, is_personal: true });
+  await ctx.answerInlineQuery(results, { cache_time: 10, is_personal: true }).catch(err => {
+    console.error('[answerInlineQuery error]:', err.message);
+  });
 });
 
 bot.on('message:text', async (ctx) => {
@@ -499,8 +515,6 @@ if (process.argv[1] && process.argv[1].endsWith('bot.js')) {
   }
 
   await storage.init();
-  await directoryCache.init();
-  await scheduleWatcher.init();
   await bot.api.deleteMyCommands().catch(() => {});
 
   const dirCount = dbManager.db.prepare('SELECT count(*) as count FROM directory_items').get().count;
@@ -509,6 +523,9 @@ if (process.argv[1] && process.argv[1].endsWith('bot.js')) {
     console.log('Инициализация базы данных и аудиторий...');
     await fetchOfficialDirectory().catch(err => console.error('Ошибка инициализации:', err.message));
   }
+
+  await directoryCache.init();
+  await scheduleWatcher.init();
   console.log('Запуск Telegram-бота...');
   bot.start({
     onStart: (botInfo) => {

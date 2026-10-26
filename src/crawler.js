@@ -1,5 +1,6 @@
 import { dbManager } from './db.js';
 import { syncAuditoriumSchedule } from './auditorium.js';
+import { directoryCache } from './cache.js';
 
 const OFFICIAL_LIST_URL = 'http://services.niu.ranepa.ru/API/public/teacher/teachersAndGroupsList';
 const VERSION_URL = 'http://services.niu.ranepa.ru/API/public/teacher/teachersAndGroupsList/version';
@@ -82,6 +83,8 @@ export async function fetchOfficialDirectory() {
   console.log('Синхронизация расписания аудиторий...');
   const audRes = await syncAuditoriumSchedule();
   console.log(`- Занятий в аудиториях: ${audRes.totalLessons}`);
+
+  directoryCache.reload();
 
   return {
     version,
