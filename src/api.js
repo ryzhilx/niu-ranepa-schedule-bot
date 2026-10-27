@@ -25,6 +25,39 @@ export const MONTHS_GENITIVE = [
   'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря'
 ];
 
+const LESSON_TYPE_LABELS = new Map([
+  ['лек', 'Лекция'],
+  ['лекция', 'Лекция'],
+  ['прак', 'Практика'],
+  ['практ', 'Практика'],
+  ['практика', 'Практика'],
+  ['сем', 'Семинар'],
+  ['семинар', 'Семинар'],
+  ['лаб', 'Лабораторная работа'],
+  ['лабораторная', 'Лабораторная работа'],
+  ['лаб.раб', 'Лабораторная работа'],
+  ['лабораторная работа', 'Лабораторная работа'],
+  ['конс', 'Консультация'],
+  ['консультация', 'Консультация'],
+  ['экз', 'Экзамен'],
+  ['экзамен', 'Экзамен'],
+  ['зач', 'Зачёт'],
+  ['зачет', 'Зачёт'],
+  ['зачёт', 'Зачёт'],
+  ['диф.зач', 'Дифференцированный зачёт'],
+  ['дифзач', 'Дифференцированный зачёт'],
+  ['курс', 'Курсовая работа'],
+  ['курсовая', 'Курсовая работа']
+]);
+
+export function formatLessonType(rawType) {
+  if (!rawType) return '';
+  const base = String(rawType).split(',')[0].trim();
+  if (!base) return '';
+  const key = base.toLowerCase().replace(/[.\s]+$/, '');
+  return LESSON_TYPE_LABELS.get(key) ?? base;
+}
+
 export class ScheduleSourceError extends Error {
   constructor(code, message, options = {}) {
     super(message, options);
@@ -326,7 +359,7 @@ export function formatDayLessonsHtml(dayData, targetType = 'Group') {
 
     text += `<b>${escapeHtml(l.subject)}</b>\n`;
     if (l.type) {
-      text += `<i>${escapeHtml(l.type)}</i>\n`;
+      text += `<i>${escapeHtml(formatLessonType(l.type))}</i>\n`;
     }
     if (targetType === 'Auditorium') {
       if (l.group) text += `Группа: ${escapeHtml(l.group)}\n`;

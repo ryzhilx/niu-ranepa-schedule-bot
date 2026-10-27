@@ -37,6 +37,13 @@ function parseXdtToDateVal(xdt) {
   return { dateStr: `${pad(d)}.${pad(m)}.${y}`, dateVal: y * 10000 + m * 100 + d };
 }
 
+export const AUDITORIUM_CACHE_VERSION = '2';
+
+function getDateVal(dateStr) {
+  const parsed = parseXdtToDateVal(dateStr);
+  return parsed ? parsed.dateVal : null;
+}
+
 export async function syncAuditoriumSchedule(dateBegin = null, dateEnd = null, groupsInput = null) {
   dbManager.init();
 
@@ -53,24 +60,40 @@ export async function syncAuditoriumSchedule(dateBegin = null, dateEnd = null, g
     groups = all.filter(i => i.type === '0' && i.oid);
   }
 
-
   const records = [];
+  const succeededGroups = new Set();
+  const failedGroups = new Set();
   const concurrency = 10;
 
   for (let i = 0; i < groups.length; i += concurrency) {
     const chunk = groups.slice(i, i + concurrency);
-    const chunkResults = await Promise.all(chunk.map(g =>
-      fetchWithTimeout('http://services.niu.ranepa.ru/API/public/group/getSchedule', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({ id: g.oid, dateBegin: dstart, dateEnd: dfinish }).toString()
-      }, 20000)
-        .then(r => r.json().then(list => ({ group: g.value, list })))
-        .catch(() => ({ group: g.value, list: [] }))
-    ));
+    const chunkResults = await Promise.all(chunk.map(async g => {
+      try {
+        const res = await fetchWithTimeout('http://services.niu.ranepa.ru/API/public/group/getSchedule', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({ id: g.oid, dateBegin: dstart, dateEnd: dfinish }).toString()
+        }, 20000);
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status}`);
+        }
+        const list = await res.json();
+        if (!Array.isArray(list)) {
+          throw new Error('API returned a non-array schedule');
+        }
+        return { group: g.value, list };
+      } catch (err) {
+        console.warn(`[auditorium sync error for "${g.value}"]:`, err.message);
+        return { group: g.value, list: null };
+      }
+    }));
 
     for (const { group, list } of chunkResults) {
-      if (!Array.isArray(list)) continue;
+      if (!Array.isArray(list)) {
+        failedGroups.add(group);
+        continue;
+      }
+      succeededGroups.add(group);
       for (const item of list) {
         const aud = (item.number || '').trim();
         if (!aud) continue;
@@ -99,36 +122,71 @@ export async function syncAuditoriumSchedule(dateBegin = null, dateEnd = null, g
     }
   }
 
+  if (groups.length > 0 && succeededGroups.size === 0) {
+    throw new Error('Не удалось синхронизировать расписание аудиторий: все группы вернули ошибку');
+  }
+
+  const startVal = getDateVal(dstart);
+  const finishVal = getDateVal(dfinish);
+  const allGroupsSucceeded = failedGroups.size === 0;
+
   const insertStmt = dbManager.db.prepare(`
     INSERT OR REPLACE INTO auditorium_lessons 
     (auditorium, normalized_auditorium, date, date_val, start_time, end_time, subject, type, teacher, group_name)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
+  const deleteAllStmt = dbManager.db.prepare(
+    'DELETE FROM auditorium_lessons WHERE date_val >= ? AND date_val <= ?'
+  );
+  const deleteGroupStmt = dbManager.db.prepare(
+    'DELETE FROM auditorium_lessons WHERE date_val >= ? AND date_val <= ? AND group_name = ?'
+  );
+  const metaStmt = dbManager.db.prepare('INSERT OR REPLACE INTO directory_meta (key, value) VALUES (?, ?)');
 
   dbManager.db.exec('BEGIN TRANSACTION;');
   try {
+    if (groups.length > 0 && startVal !== null && finishVal !== null) {
+      if (allGroupsSucceeded) {
+        deleteAllStmt.run(startVal, finishVal);
+      } else {
+        for (const group of succeededGroups) {
+          deleteGroupStmt.run(startVal, finishVal, group);
+        }
+      }
+    }
+
     for (const rec of records) {
       insertStmt.run(...rec);
     }
-    dbManager.db.prepare('INSERT OR REPLACE INTO directory_meta (key, value) VALUES (?, ?)').run(
-      'lastAuditoriumSync',
-      new Date().toISOString()
-    );
+
+    metaStmt.run('lastAuditoriumSync', new Date().toISOString());
+    metaStmt.run('auditoriumCacheVersion', AUDITORIUM_CACHE_VERSION);
+
     dbManager.db.exec('COMMIT;');
   } catch (err) {
     dbManager.db.exec('ROLLBACK;');
     throw err;
   }
 
-  return { totalLessons: records.length };
+  return {
+    totalLessons: records.length,
+    groupsSucceeded: succeededGroups.size,
+    groupsFailed: failedGroups.size
+  };
 }
 
 export async function ensureAuditoriumSchedule() {
   dbManager.init();
   const countRow = dbManager.db.prepare('SELECT count(*) as count FROM auditorium_lessons').get();
-  if (countRow.count === 0) {
-    await syncAuditoriumSchedule();
+  const versionRow = dbManager.db
+    .prepare('SELECT value FROM directory_meta WHERE key = ?')
+    .get('auditoriumCacheVersion');
+
+  if (countRow.count > 0 && versionRow?.value === AUDITORIUM_CACHE_VERSION) {
+    return null;
   }
+
+  return syncAuditoriumSchedule();
 }
 
 export function searchAuditoriums(query, limit = 8) {
