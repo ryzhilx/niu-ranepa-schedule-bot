@@ -5,8 +5,11 @@ import fs from 'fs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const DATA_DIR = path.join(__dirname, '..', 'data');
-const DB_PATH = path.join(DATA_DIR, 'bot.db');
+const DEFAULT_DATA_DIR = path.join(__dirname, '..', 'data');
+const DB_PATH = process.env.BOT_DB_PATH
+  ? path.resolve(process.env.BOT_DB_PATH)
+  : path.join(DEFAULT_DATA_DIR, 'bot.db');
+const DATA_DIR = process.env.BOT_DB_PATH ? path.dirname(DB_PATH) : DEFAULT_DATA_DIR;
 
 class DatabaseManager {
   constructor() {
@@ -26,6 +29,7 @@ class DatabaseManager {
     this.db.exec('PRAGMA synchronous = NORMAL;');
 
     this.initTables();
+    this.migrateSnapshotSource();
     this.migrateFromJson();
 
     this.initialized = true;
@@ -46,7 +50,8 @@ class DatabaseManager {
         target TEXT PRIMARY KEY,
         target_type TEXT,
         lessons_json TEXT NOT NULL,
-        updated_at TEXT NOT NULL
+        updated_at TEXT NOT NULL,
+        source TEXT
       );
 
       CREATE TABLE IF NOT EXISTS directory_items (
@@ -82,6 +87,13 @@ class DatabaseManager {
       CREATE INDEX IF NOT EXISTS idx_aud_norm ON auditorium_lessons(normalized_auditorium);
       CREATE INDEX IF NOT EXISTS idx_aud_date ON auditorium_lessons(normalized_auditorium, date_val);
     `);
+  }
+
+  migrateSnapshotSource() {
+    const columns = this.db.prepare('PRAGMA table_info(snapshots)').all();
+    if (!columns.some(column => column.name === 'source')) {
+      this.db.exec('ALTER TABLE snapshots ADD COLUMN source TEXT;');
+    }
   }
 
   migrateFromJson() {

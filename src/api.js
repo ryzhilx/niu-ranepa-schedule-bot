@@ -6,8 +6,8 @@ import {
   ensureAuditoriumSchedule,
   normalizeAuditorium
 } from './auditorium.js';
+import { refreshDirectoryIfNeeded } from './crawler.js';
 
-const BASE_URL = 'http://services.niu.ranepa.ru/wp-content/plugins/rasp/rasp_json_data.php';
 const MOBILE_API_BASE = 'http://services.niu.ranepa.ru/API/public';
 
 export const WEEKDAYS = [
@@ -25,10 +25,12 @@ export const MONTHS_GENITIVE = [
   'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря'
 ];
 
-function normalizeArray(items) {
-  if (!items) return [];
-  if (Array.isArray(items)) return items;
-  return [items];
+export class ScheduleSourceError extends Error {
+  constructor(code, message, options = {}) {
+    super(message, options);
+    this.name = 'ScheduleSourceError';
+    this.code = code;
+  }
 }
 
 export function formatDate(d = new Date()) {
@@ -39,12 +41,13 @@ export function formatDate(d = new Date()) {
 }
 
 export function parseDate(dateStr) {
-  if (dateStr.includes('-') && dateStr.includes(':')) {
-    const [d] = dateStr.split(' ');
-    const [year, month, day] = d.split('-').map(Number);
+  const value = String(dateStr);
+  if (value.includes('-')) {
+    const [datePart] = value.split(/[ T]/);
+    const [year, month, day] = datePart.split('-').map(Number);
     return new Date(year, month - 1, day);
   }
-  const [day, month, year] = dateStr.split('.').map(Number);
+  const [day, month, year] = value.split('.').map(Number);
   return new Date(year, month - 1, day);
 }
 
@@ -78,38 +81,6 @@ export function getWeekRange(baseDate = new Date(), weekOffset = 0) {
   };
 }
 
-export function parseLessonName(rawName) {
-  if (!rawName) return { subject: '', type: '', teacher: '' };
-
-  const parts = rawName.split(/<br\s*\/?>/i).map(s => s.trim()).filter(Boolean);
-  const lessonPart = parts[0] || '';
-  const teacher = parts.slice(1).join(', ') || '';
-
-  let subject = lessonPart;
-  let type = '';
-
-  if (lessonPart.endsWith(')')) {
-    let depth = 0;
-    let openIdx = -1;
-    for (let i = lessonPart.length - 1; i >= 0; i--) {
-      if (lessonPart[i] === ')') depth++;
-      else if (lessonPart[i] === '(') {
-        depth--;
-        if (depth === 0) {
-          openIdx = i;
-          break;
-        }
-      }
-    }
-    if (openIdx > 0) {
-      type = lessonPart.slice(openIdx + 1, -1).trim();
-      subject = lessonPart.slice(0, openIdx).trim();
-    }
-  }
-
-  return { subject, type, teacher };
-}
-
 export async function search(query) {
   if (!query || query.trim().length === 0) return [];
   const cleanQuery = query
@@ -122,43 +93,11 @@ export async function search(query) {
   if (!cleanQuery) return [];
 
   await directoryCache.init();
-  await ensureAuditoriumSchedule();
 
   const audMatches = searchAuditoriums(cleanQuery);
   const localMatches = directoryCache.search(cleanQuery);
 
-  const combined = [...audMatches, ...localMatches];
-  if (combined.length > 0) {
-    return combined;
-  }
-
-  const url = `${BASE_URL}?name=${encodeURIComponent(cleanQuery)}`;
-
-  try {
-    const res = await fetch(url, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (Node.js NIU RANEPA Schedule Bot)' }
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    const rawItems = data?.GetNameUidForRaspResult?.ItemRaspUID;
-    const items = normalizeArray(rawItems);
-
-    const mapped = items.map(item => ({
-      id: item.id,
-      type: item.Type,
-      title: item.Title
-    }));
-
-    for (const m of mapped) {
-      if (m.type === 'Prep') directoryCache.addTeacher(m.title, m.id);
-      else if (m.type === 'Group') directoryCache.addGroup(m.title);
-    }
-
-    return mapped;
-  } catch (err) {
-    console.error(`[search error: "${cleanQuery}"]:`, err.message);
-    return [];
-  }
+  return [...audMatches, ...localMatches];
 }
 
 async function fetchMobileSchedule(endpoint, id, startDate, finishDate) {
@@ -177,8 +116,54 @@ async function fetchMobileSchedule(endpoint, id, startDate, finishDate) {
     throw new Error(`Mobile API HTTP ${res.status}`);
   }
 
-  const items = await res.json();
-  return items;
+  return res.json();
+}
+
+function buildScheduleResult(target, targetType, startDate, endDate, lessons) {
+  const byDateMap = new Map();
+  for (const lesson of lessons) {
+    if (!byDateMap.has(lesson.date)) {
+      byDateMap.set(lesson.date, []);
+    }
+    byDateMap.get(lesson.date).push(lesson);
+  }
+
+  const days = [];
+  for (const [dateStr, dayLessons] of byDateMap.entries()) {
+    const dateObj = parseDate(dateStr);
+    days.push({
+      date: dateStr,
+      dateObj,
+      dayOfWeek: WEEKDAYS[dateObj.getDay()] || '',
+      lessons: dayLessons.sort((a, b) => a.startTime.localeCompare(b.startTime))
+    });
+  }
+
+  days.sort((a, b) => a.dateObj - b.dateObj);
+
+  return {
+    target,
+    targetType,
+    startDate,
+    endDate,
+    totalLessons: lessons.length,
+    days,
+    source: 'mobile'
+  };
+}
+
+function resolveDirectoryTarget(cleanTarget) {
+  const teacherObj = directoryCache.getTeacher(cleanTarget);
+  if (teacherObj) {
+    return { targetType: 'Prep', title: teacherObj.title, id: teacherObj.id };
+  }
+
+  const groupObj = directoryCache.getGroup(cleanTarget);
+  if (groupObj) {
+    return { targetType: 'Group', title: groupObj.title, id: groupObj.id };
+  }
+
+  return { targetType: 'Unknown', title: cleanTarget, id: null };
 }
 
 export async function getSchedule(target, startDate, finishDate) {
@@ -191,210 +176,118 @@ export async function getSchedule(target, startDate, finishDate) {
   const dstart = startDate || formatDate(new Date());
   const dfinish = finishDate || dstart;
 
-  await ensureAuditoriumSchedule();
-
   if (/^(?:аудитория|аудитории|ауд|кабинет|каб)[.\s]*/i.test(cleanTarget) || cleanTarget.startsWith('Ауд.')) {
-    return getAuditoriumSchedule(cleanTarget, dstart, dfinish);
-  }
-
-  const audResults = searchAuditoriums(cleanTarget, 1);
-  if (audResults.length > 0 && normalizeAuditorium(audResults[0].id) === normalizeAuditorium(cleanTarget)) {
-    return getAuditoriumSchedule(audResults[0].id, dstart, dfinish);
+    await ensureAuditoriumSchedule();
+    return {
+      ...(await getAuditoriumSchedule(cleanTarget, dstart, dfinish)),
+      source: 'auditorium'
+    };
   }
 
   await directoryCache.init();
 
-  let knownOid = null;
-  let targetType = 'Unknown';
-
-  const teacherObj = directoryCache.getTeacher(cleanTarget);
-  if (teacherObj) {
-    targetType = 'Prep';
-    cleanTarget = teacherObj.title;
-    knownOid = teacherObj.id;
-  } else {
-    const groupObj = directoryCache.getGroup(cleanTarget);
-    if (groupObj) {
-      targetType = 'Group';
-      cleanTarget = groupObj.title;
-      knownOid = groupObj.id;
-    }
+  const audResults = searchAuditoriums(cleanTarget, 1);
+  if (audResults.length > 0 && normalizeAuditorium(audResults[0].id) === normalizeAuditorium(cleanTarget)) {
+    await ensureAuditoriumSchedule();
+    return {
+      ...(await getAuditoriumSchedule(audResults[0].id, dstart, dfinish)),
+      source: 'auditorium'
+    };
   }
 
-  if (knownOid && targetType !== 'Unknown') {
-    try {
-      const endpoint = targetType === 'Prep' ? 'teacher/getSchedule' : 'group/getSchedule';
-      const mobileItems = await fetchMobileSchedule(endpoint, knownOid, dstart, dfinish);
+  let resolved = resolveDirectoryTarget(cleanTarget);
 
-      const startVal = parseDate(dstart).getTime();
-      const finishVal = parseDate(dfinish).getTime();
-
-      const parsedLessons = (mobileItems || [])
-        .map(item => {
-          let dateStr = item.xdt || dstart;
-          if (dateStr.includes(' ')) {
-            const [dPart] = dateStr.split(' ');
-            const [y, m, d] = dPart.split('-');
-            dateStr = `${d}.${m}.${y}`;
-          }
-
-
-
-          let lessonType = item.type || '';
-          let lessonGroup = item.group || '';
-          if (targetType === 'Group' && !lessonGroup && lessonType.includes(',')) {
-            const commaIdx = lessonType.indexOf(',');
-            lessonGroup = lessonType.slice(commaIdx + 1).trim();
-            lessonType = lessonType.slice(0, commaIdx).trim();
-          }
-
-          return {
-            date: dateStr,
-            startTime: item.nf || '',
-            endTime: item.kf || '',
-            subject: item.subject || '',
-            type: lessonType,
-            auditorium: item.number || '',
-            teacher: item.teacher || '',
-            group: lessonGroup,
-            changeNote: null
-          };
-        })
-        .filter(l => {
-          const t = parseDate(l.date).getTime();
-          return t >= startVal && t <= finishVal;
-        });
-
-      const byDateMap = new Map();
-      for (const lesson of parsedLessons) {
-        if (!byDateMap.has(lesson.date)) {
-          byDateMap.set(lesson.date, []);
-        }
-        byDateMap.get(lesson.date).push(lesson);
-      }
-
-      const days = [];
-      for (const [dateStr, lessons] of byDateMap.entries()) {
-        const dateObj = parseDate(dateStr);
-        days.push({
-          date: dateStr,
-          dateObj,
-          dayOfWeek: WEEKDAYS[dateObj.getDay()] || '',
-          lessons: lessons.sort((a, b) => a.startTime.localeCompare(b.startTime))
-        });
-      }
-
-      days.sort((a, b) => a.dateObj - b.dateObj);
-
-      return {
-        target: cleanTarget,
-        targetType,
-        startDate: dstart,
-        endDate: dfinish,
-        totalLessons: parsedLessons.length,
-        days
-      };
-    } catch (err) {
-      console.warn(`[Mobile API error for ${cleanTarget}, falling back to web]:`, err.message);
-    }
-  }
-
-  const url = `${BASE_URL}?user=${encodeURIComponent(cleanTarget)}&dstart=${dstart}&dfinish=${dfinish}`;
-  const res = await fetchWithTimeout(url, {
-    headers: { 'User-Agent': 'Mozilla/5.0 (Node.js NIU RANEPA Schedule Bot)' }
-  });
-
-  if (!res.ok) {
-    throw new Error(`Schedule API HTTP ${res.status}`);
-  }
-
-  const text = await res.text();
-  if (!text || text.trim() === 'null') {
+  if (resolved.targetType === 'Unknown') {
     return {
       target: cleanTarget,
       targetType: 'Unknown',
       startDate: dstart,
       endDate: dfinish,
       totalLessons: 0,
-      days: []
+      days: [],
+      source: 'mobile',
+      notFound: true
     };
   }
 
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch (e) {
-    throw new Error(`Failed to parse schedule JSON: ${e.message}`);
+  cleanTarget = resolved.title;
+
+  if (!resolved.id) {
+    try {
+      await refreshDirectoryIfNeeded({ force: true });
+    } catch (err) {
+      console.warn(`[directory refresh error for "${cleanTarget}"]:`, err.message);
+    }
+    resolved = resolveDirectoryTarget(cleanTarget);
+    cleanTarget = resolved.title;
   }
 
-  let rawItems = [];
-  if (data?.GetRaspGroupResult) {
-    targetType = 'Group';
-    rawItems = normalizeArray(data.GetRaspGroupResult.RaspItem);
-  } else if (data?.GetRaspPrepResult) {
-    targetType = 'Prep';
-    rawItems = normalizeArray(data.GetRaspPrepResult.RaspItem);
+  if (!resolved.id || resolved.targetType === 'Unknown') {
+    throw new ScheduleSourceError(
+      'MISSING_OID',
+      `Не удалось определить идентификатор «${cleanTarget}» в мобильном API расписания`
+    );
+  }
+
+  const endpoint = resolved.targetType === 'Prep' ? 'teacher/getSchedule' : 'group/getSchedule';
+  let mobileItems;
+  try {
+    mobileItems = await fetchMobileSchedule(endpoint, resolved.id, dstart, dfinish);
+    if (!Array.isArray(mobileItems)) {
+      throw new Error('Mobile API returned a non-array response');
+    }
+  } catch (err) {
+    throw new ScheduleSourceError(
+      'MOBILE_UNAVAILABLE',
+      `Сервис расписания временно недоступен: ${err.message}`,
+      { cause: err }
+    );
   }
 
   const startVal = parseDate(dstart).getTime();
   const finishVal = parseDate(dfinish).getTime();
 
-  const allLessons = rawItems.map(item => {
-    const { subject, type, teacher } = parseLessonName(item.name);
-    return {
-      date: item.date,
-      startTime: item.timestart,
-      endTime: item.timefinish,
-      subject: subject || item.name,
-      type: type || '',
-      auditorium: item.aydit || '',
-      teacher: teacher || '',
-      group: item.namegroup || '',
-      changeNote: item.OldState || null
-    };
-  });
+  const parsedLessons = mobileItems
+    .map(item => {
+      let dateStr = String(item.xdt || dstart);
+      if (dateStr.includes('-')) {
+        const [datePart] = dateStr.split(/[ T]/);
+        const [y, m, d] = datePart.split('-');
+        dateStr = `${d}.${m}.${y}`;
+      }
 
-  directoryCache.learnFromLessons(allLessons);
-  if (targetType === 'Group') {
-    directoryCache.addGroup(cleanTarget);
-  } else if (targetType === 'Prep') {
-    directoryCache.addTeacher(cleanTarget);
-  }
+      let lessonType = item.type || '';
+      let lessonGroup = item.group || '';
+      if (resolved.targetType === 'Group' && !lessonGroup && lessonType.includes(',')) {
+        const commaIdx = lessonType.indexOf(',');
+        lessonGroup = lessonType.slice(commaIdx + 1).trim();
+        lessonType = lessonType.slice(0, commaIdx).trim();
+      }
 
-  const parsedLessons = allLessons.filter(l => {
-    const t = parseDate(l.date).getTime();
-    return t >= startVal && t <= finishVal;
-  });
-
-  const byDateMap = new Map();
-  for (const lesson of parsedLessons) {
-    if (!byDateMap.has(lesson.date)) {
-      byDateMap.set(lesson.date, []);
-    }
-    byDateMap.get(lesson.date).push(lesson);
-  }
-
-  const days = [];
-  for (const [dateStr, lessons] of byDateMap.entries()) {
-    const dateObj = parseDate(dateStr);
-    days.push({
-      date: dateStr,
-      dateObj,
-      dayOfWeek: WEEKDAYS[dateObj.getDay()] || '',
-      lessons: lessons.sort((a, b) => a.startTime.localeCompare(b.startTime))
+      return {
+        date: dateStr,
+        startTime: item.nf || '',
+        endTime: item.kf || '',
+        subject: item.subject || '',
+        type: lessonType,
+        auditorium: item.number || '',
+        teacher: item.teacher || '',
+        group: lessonGroup,
+        changeNote: null
+      };
+    })
+    .filter(l => {
+      const t = parseDate(l.date).getTime();
+      return t >= startVal && t <= finishVal;
     });
-  }
 
-  days.sort((a, b) => a.dateObj - b.dateObj);
-
-  return {
-    target: cleanTarget,
-    targetType,
-    startDate: dstart,
-    endDate: dfinish,
-    totalLessons: parsedLessons.length,
-    days
-  };
+  return buildScheduleResult(
+    cleanTarget,
+    resolved.targetType,
+    dstart,
+    dfinish,
+    parsedLessons
+  );
 }
 
 export function escapeHtml(str) {

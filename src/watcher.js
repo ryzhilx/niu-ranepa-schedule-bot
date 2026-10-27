@@ -4,7 +4,8 @@ import {
   getTodayDate,
   getWeekRange,
   parseDate,
-  WEEKDAYS
+  WEEKDAYS,
+  ScheduleSourceError
 } from './api.js';
 import { storage } from './storage.js';
 import { dbManager } from './db.js';
@@ -177,6 +178,13 @@ export function formatChangesNotification(target, changesByDay) {
   return text.trim();
 }
 
+function formatWatcherError(err) {
+  if (err instanceof ScheduleSourceError && err.code === 'MOBILE_UNAVAILABLE') {
+    return 'Сервис расписания временно недоступен';
+  }
+  return err.message;
+}
+
 class ScheduleWatcher {
   constructor() {
     this.snapshots = new Map();
@@ -189,12 +197,13 @@ class ScheduleWatcher {
     if (this.loaded) return;
     dbManager.init();
 
-    const rows = dbManager.db.prepare('SELECT target, target_type, lessons_json, updated_at FROM snapshots').all();
+    const rows = dbManager.db.prepare('SELECT target, target_type, lessons_json, updated_at, source FROM snapshots').all();
     for (const r of rows) {
       this.snapshots.set(r.target, {
         target: r.target,
         targetType: r.target_type || 'Group',
         updatedAt: r.updated_at,
+        source: r.source || null,
         lessons: JSON.parse(r.lessons_json || '[]')
       });
     }
@@ -202,19 +211,20 @@ class ScheduleWatcher {
     this.loaded = true;
   }
 
-  saveSnapshot(target, lessons, targetType = 'Group') {
+  saveSnapshot(target, lessons, targetType = 'Group', source = 'mobile') {
     const updatedAt = new Date().toISOString();
     this.snapshots.set(target, {
       target,
       targetType,
+      source,
       updatedAt,
       lessons
     });
 
     dbManager.db.prepare(`
-      INSERT OR REPLACE INTO snapshots (target, target_type, lessons_json, updated_at)
-      VALUES (?, ?, ?, ?)
-    `).run(target, targetType, JSON.stringify(lessons || []), updatedAt);
+      INSERT OR REPLACE INTO snapshots (target, target_type, lessons_json, updated_at, source)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(target, targetType, JSON.stringify(lessons || []), updatedAt, source);
   }
 
   async seedTarget(target) {
@@ -225,11 +235,21 @@ class ScheduleWatcher {
       const today = getTodayDate();
       const nextWeek = getWeekRange(new Date(), 1);
       const sched = await getSchedule(target, today, nextWeek.finish);
-      const lessons = sched.days.flatMap(d => d.lessons);
 
-      this.saveSnapshot(target, lessons, sched.targetType);
+      if (sched.targetType === 'Unknown' || sched.notFound) {
+        console.warn(`[seedTarget] ${target}: цель не найдена в справочнике, снапшот не сохраняем`);
+        return;
+      }
+
+      if (sched.source !== 'mobile') {
+        console.warn(`[seedTarget] ${target}: источник ${sched.source || 'unknown'}, снапшот не сохраняем`);
+        return;
+      }
+
+      const lessons = sched.days.flatMap(d => d.lessons);
+      this.saveSnapshot(target, lessons, sched.targetType, 'mobile');
     } catch (err) {
-      console.warn(`[seedTarget error for ${target}]:`, err.message);
+      console.warn(`[seedTarget error for ${target}]:`, formatWatcherError(err));
     }
   }
 
@@ -244,19 +264,39 @@ class ScheduleWatcher {
     try {
       sched = await getSchedule(target, today, nextWeek.finish);
     } catch (err) {
-      console.warn(`[watcher check failed for ${target}]:`, err.message);
-      return { target, success: false, error: err.message };
+      const message = formatWatcherError(err);
+      console.warn(`[watcher check failed for ${target}]:`, message);
+      return { target, success: false, error: message };
+    }
+
+    if (sched.targetType === 'Unknown' || sched.notFound) {
+      console.warn(`[watcher] ${target}: цель не найдена в справочнике, снапшот не обновляем`);
+      return { target, success: false, error: 'Цель не найдена в справочнике расписания' };
+    }
+
+    if (sched.source !== 'mobile') {
+      console.warn(`[watcher] ${target}: неподдерживаемый источник данных (${sched.source || 'unknown'}), снапшот не обновляем`);
+      return { target, success: false, error: 'Расписание получено не из мобильного API' };
     }
 
     const newLessons = sched.days.flatMap(d => d.lessons);
     const existing = this.snapshots.get(target);
 
     if (!existing) {
-      this.saveSnapshot(target, newLessons, sched.targetType);
+      this.saveSnapshot(target, newLessons, sched.targetType, 'mobile');
       return { target, success: true, seeded: true, hasChanges: false };
     }
 
     const oldLessons = existing.lessons || [];
+
+    if (existing.source !== 'mobile') {
+      console.warn(
+        `[watcher] ${target}: legacy-снапшот (source=${existing.source || 'unknown'}) пересоздаётся по mobile API: ` +
+        `занятий ${oldLessons.length} -> ${newLessons.length}`
+      );
+      this.saveSnapshot(target, newLessons, sched.targetType, 'mobile');
+      return { target, success: true, rebased: true, hasChanges: false };
+    }
 
     if (oldLessons.length >= 3 && newLessons.length === 0) {
       console.warn(`[watcher suspicious empty schedule for ${target}, skipping update]`);
@@ -266,7 +306,7 @@ class ScheduleWatcher {
     const diffResult = diffSchedules(oldLessons, newLessons, today);
 
     if (diffResult.hasChanges) {
-      this.saveSnapshot(target, newLessons, sched.targetType);
+      this.saveSnapshot(target, newLessons, sched.targetType, 'mobile');
 
       const message = formatChangesNotification(target, diffResult.changesByDay);
 
@@ -297,7 +337,7 @@ class ScheduleWatcher {
       };
     }
 
-    this.saveSnapshot(target, newLessons, sched.targetType);
+    this.saveSnapshot(target, newLessons, sched.targetType, 'mobile');
 
     return { target, success: true, hasChanges: false };
   }
@@ -323,6 +363,8 @@ class ScheduleWatcher {
           console.log(`[watcher] ${item.target}: ошибка — ${res.error}`);
         } else if (res.skipped) {
           console.log(`[watcher] ${item.target}: пропущено (подозрительно пустое расписание)`);
+        } else if (res.rebased) {
+          console.log(`[watcher] ${item.target}: снапшот пересоздан по mobile API`);
         } else if (res.seeded) {
           console.log(`[watcher] ${item.target}: создан первичный снапшот`);
         } else if (res.hasChanges) {

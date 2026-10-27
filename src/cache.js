@@ -2,7 +2,7 @@ import { dbManager } from './db.js';
 
 class DirectoryCache {
   constructor() {
-    this.groups = new Set();
+    this.groups = new Map();
     this.teachers = new Map();
     this.loaded = false;
   }
@@ -29,17 +29,29 @@ class DirectoryCache {
       .trim();
   }
 
-  addGroup(groupName) {
+  addGroup(groupName, id = null) {
     if (!groupName) return;
     const clean = this.cleanPrefix(groupName);
-    if (clean && !this.groups.has(clean)) {
-      this.groups.add(clean);
-      this.ensureInit();
+    if (!clean) return;
+
+    const numericId = id !== null && id !== undefined && id !== '' ? Number(id) : null;
+    const validId = Number.isFinite(numericId) ? numericId : null;
+
+    this.ensureInit();
+
+    if (!this.groups.has(clean)) {
+      this.groups.set(clean, validId);
       const norm = clean.toLowerCase().replace(/[^a-zа-яё0-9]/gi, '');
       dbManager.db.prepare(`
         INSERT OR IGNORE INTO directory_items (id, title, type, normalized_title)
-        VALUES (null, ?, 'Group', ?)
-      `).run(clean, norm);
+        VALUES (?, ?, 'Group', ?)
+      `).run(validId !== null ? String(validId) : null, clean, norm);
+    } else if (validId !== null && this.groups.get(clean) === null) {
+      this.groups.set(clean, validId);
+      dbManager.db.prepare(`
+        UPDATE directory_items SET id = ?
+        WHERE title = ? AND type = 'Group' AND (id IS NULL OR id = '')
+      `).run(String(validId), clean);
     }
   }
 
@@ -117,11 +129,13 @@ class DirectoryCache {
     const clean = this.cleanPrefix(title);
     if (!clean) return null;
 
+    const norm = clean.toLowerCase().replace(/[^a-zа-яё0-9]/gi, '');
+
     if (this.groups.has(clean)) {
-      return { title: clean, id: null };
+      const cachedId = this.groups.get(clean);
+      return { title: clean, id: cachedId === null ? null : Number(cachedId) };
     }
 
-    const norm = clean.toLowerCase().replace(/[^a-zа-яё0-9]/gi, '');
     const row = dbManager.db.prepare(`
       SELECT id, title, type FROM directory_items
       WHERE type = 'Group' AND (title = ? OR normalized_title = ? OR normalized_title LIKE ?)
@@ -129,8 +143,9 @@ class DirectoryCache {
     `).get(clean, norm, `%${norm}%`);
 
     if (row) {
-      this.groups.add(row.title);
-      return { title: row.title, id: row.id ? Number(row.id) : null };
+      const id = row.id ? Number(row.id) : null;
+      this.groups.set(row.title, id);
+      return { title: row.title, id };
     }
 
     return null;
@@ -188,7 +203,7 @@ class DirectoryCache {
         if (r.type === 'Prep') {
           this.teachers.set(r.title, { title: r.title, id: r.id ? Number(r.id) : null });
         } else {
-          this.groups.add(r.title);
+          this.groups.set(r.title, r.id ? Number(r.id) : null);
         }
       }
       this.loaded = true;

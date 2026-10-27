@@ -7,19 +7,31 @@ import {
   getTodayDate,
   getTomorrowDate,
   getWeekRange,
-  formatScheduleMessages
+  formatScheduleMessages,
+  ScheduleSourceError
 } from './api.js';
 import { storage } from './storage.js';
 import { directoryCache } from './cache.js';
 import { scheduleWatcher } from './watcher.js';
 import { dbManager } from './db.js';
-import { fetchOfficialDirectory } from './crawler.js';
+import { refreshDirectoryIfNeeded } from './crawler.js';
 import { makeRef, resolveRef } from './refs.js';
 import { pending, PENDING_TARGET, PENDING_SEARCH } from './pendingState.js';
 
 function resolveTarget(code) {
   const ref = resolveRef(code);
   return ref ? ref.value : code;
+}
+
+function scheduleUnavailableText() {
+  return 'Сервис расписания временно недоступен, попробуйте позже.';
+}
+
+function describeScheduleError(err) {
+  if (err instanceof ScheduleSourceError) {
+    return scheduleUnavailableText();
+  }
+  return `Причина: ${err.message}`;
 }
 
 const token = process.env.BOT_TOKEN;
@@ -111,7 +123,7 @@ async function sendScheduleToUser(ctx, target, startDate, endDate, viewType = 't
     console.error(`[getSchedule error for "${target}"]:`, err.message);
     await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
     await ctx.reply(
-      `<b>Не удалось получить расписание</b>\n\nПричина: ${err.message}`,
+      `<b>Не удалось получить расписание</b>\n\n${describeScheduleError(err)}`,
       { parse_mode: 'HTML' }
     );
   }
@@ -195,7 +207,8 @@ bot.callbackQuery(/^view:(today|tomorrow|thisweek|nextweek):(.+)$/, async (ctx) 
     }
   } catch (err) {
     console.error(`[view callback error for "${target}"]:`, err.message);
-    await ctx.answerCallbackQuery({ text: 'Ошибка обновления' }).catch(() => {});
+    const text = err instanceof ScheduleSourceError ? 'Сервис расписания временно недоступен' : 'Ошибка обновления';
+    await ctx.answerCallbackQuery({ text }).catch(() => {});
   }
 });
 
@@ -299,6 +312,7 @@ bot.on('inline_query', async (ctx) => {
   }
 
   const results = [];
+  let sourceUnavailable = false;
   const today = getTodayDate();
   const week = getWeekRange(new Date(), 0);
 
@@ -341,8 +355,19 @@ bot.on('inline_query', async (ctx) => {
         }
       });
     } catch (err) {
+      if (err instanceof ScheduleSourceError) {
+        sourceUnavailable = true;
+      }
       console.error(`[inline_query error for ${t.title}]:`, err.message);
     }
+  }
+
+  if (results.length === 0 && sourceUnavailable) {
+    return ctx.answerInlineQuery([], {
+      cache_time: 5,
+      switch_pm_text: 'Сервис расписания временно недоступен, попробуйте позже',
+      switch_pm_parameter: 'search'
+    });
   }
 
   await ctx.answerInlineQuery(results, { cache_time: 0, is_personal: true }).catch(err => {
@@ -507,8 +532,11 @@ bot.on('message:text', async (ctx) => {
   } catch (err) {
     console.error('[search/verification error]:', err.message);
     await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
+    const text = err instanceof ScheduleSourceError
+      ? scheduleUnavailableText()
+      : `Ошибка: ${err.message}`;
     return ctx.reply(
-      `Ошибка: ${err.message}`,
+      text,
       { reply_markup: getMainMenuKeyboard(Boolean(user?.target)) }
     );
   }
@@ -527,14 +555,13 @@ if (process.argv[1] && process.argv[1].endsWith('bot.js')) {
   await storage.init();
   await bot.api.deleteMyCommands().catch(() => {});
 
-  const dirCount = dbManager.db.prepare('SELECT count(*) as count FROM directory_items').get().count;
-  const audCount = dbManager.db.prepare('SELECT count(*) as count FROM auditorium_lessons').get().count;
-  if (dirCount === 0 || audCount === 0) {
-    console.log('Инициализация базы данных и аудиторий...');
-    await fetchOfficialDirectory().catch(err => console.error('Ошибка инициализации:', err.message));
-  }
-
   await directoryCache.init();
+
+  const audCount = dbManager.db.prepare('SELECT count(*) as count FROM auditorium_lessons').get().count;
+  console.log('Обновление официального справочника...');
+  await refreshDirectoryIfNeeded({ syncAuditoria: audCount === 0 })
+    .catch(err => console.error('Ошибка обновления справочника:', err.message));
+
   await scheduleWatcher.init();
 
   let shuttingDown = false;
