@@ -240,3 +240,109 @@ test('ensureAuditoriumSchedule refreshes a legacy cache and stores the version',
   const second = await auditorium.ensureAuditoriumSchedule();
   assert.equal(second, null);
 });
+
+function makeLessons(count, overrides = {}) {
+  return Array.from({ length: count }, (_, i) => ({
+    startTime: '09:00',
+    endTime: '10:30',
+    subject: `Дисциплина ${i + 1} с длинным названием`,
+    type: 'Прак',
+    auditorium: '315',
+    teacher: 'Иванов И.И.',
+    group: '',
+    ...overrides
+  }));
+}
+
+test('formatScheduleMessages splits a huge day into safe chunks and repeats the day header', () => {
+  const lessons = makeLessons(120);
+  const messages = api.formatScheduleMessages({
+    target: 'Иб-321',
+    targetType: 'Group',
+    startDate: '27.10.2026',
+    endDate: '27.10.2026',
+    totalLessons: lessons.length,
+    days: [{ date: '27.10.2026', lessons }],
+    source: 'mobile'
+  });
+
+  assert.ok(messages.length > 1);
+
+  const dayHeader = api.formatDayHeader('27.10.2026');
+  for (const message of messages) {
+    assert.ok(message.length <= api.MAX_MESSAGE_LENGTH, `chunk is ${message.length} chars`);
+    assert.ok(message.length <= 4096);
+    assert.ok(message.includes(dayHeader));
+  }
+
+  const combined = messages.join('\n');
+  assert.ok(combined.includes('1. <code>09:00 - 10:30</code>'));
+  assert.ok(combined.includes('120. <code>09:00 - 10:30</code>'));
+});
+
+test('formatScheduleMessages keeps HTML tags balanced when a chunk boundary splits a lesson block', () => {
+  const lessons = makeLessons(150);
+  const messages = api.formatScheduleMessages({
+    target: 'Иб-321',
+    targetType: 'Group',
+    startDate: '27.10.2026',
+    endDate: '27.10.2026',
+    totalLessons: lessons.length,
+    days: [{ date: '27.10.2026', lessons }],
+    source: 'mobile'
+  });
+
+  for (const message of messages) {
+    const openTags = (message.match(/<(b|i|code)>/g) || []).length;
+    const closeTags = (message.match(/<\/(b|i|code)>/g) || []).length;
+    assert.equal(openTags, closeTags, 'HTML tags must be balanced inside each message');
+  }
+});
+
+test('auditorium blocks truncate a long group list and keep lines short', () => {
+  const groups = Array.from({ length: 80 }, (_, i) => `Гр-${i + 1}`);
+  const groupList = groups.join(', ');
+  const lessons = makeLessons(5, { group: groupList });
+
+  const messages = api.formatScheduleMessages({
+    target: 'Ауд. 315',
+    targetType: 'Auditorium',
+    startDate: '27.10.2026',
+    endDate: '27.10.2026',
+    totalLessons: lessons.length,
+    days: [{ date: '27.10.2026', lessons }],
+    source: 'auditorium'
+  });
+
+  const combined = messages.join('\n');
+  assert.ok(combined.includes('и ещё 60 групп'));
+  assert.ok(!combined.includes('Гр-80'));
+
+  for (const message of messages) {
+    for (const line of message.split('\n')) {
+      assert.ok(line.length < 1000, `line is ${line.length} chars`);
+    }
+  }
+});
+
+test('regular schedule can show the full auditorium group list', () => {
+  const groups = Array.from({ length: 80 }, (_, i) => `Гр-${i + 1}`);
+  const lessons = makeLessons(1, { group: groups.join(', ') });
+
+  const messages = api.formatScheduleMessages({
+    target: 'Ауд. 315',
+    targetType: 'Auditorium',
+    startDate: '27.10.2026',
+    endDate: '27.10.2026',
+    totalLessons: lessons.length,
+    days: [{ date: '27.10.2026', lessons }],
+    source: 'auditorium'
+  }, { maxAuditoriumGroups: Infinity });
+
+  const combined = messages.join('\n');
+  assert.ok(combined.includes('Гр-80'));
+  assert.ok(!combined.includes('и ещё'));
+  for (const message of messages) {
+    assert.ok(message.length <= api.MAX_MESSAGE_LENGTH);
+  }
+});

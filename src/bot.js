@@ -8,6 +8,7 @@ import {
   getTomorrowDate,
   getWeekRange,
   formatScheduleMessages,
+  splitMessageText,
   ScheduleSourceError
 } from './api.js';
 import { storage } from './storage.js';
@@ -103,18 +104,35 @@ function getScheduleInlineKeyboard(target, currentView = 'today') {
   return keyboard;
 }
 
+async function replyChunked(ctx, text, options = {}) {
+  try {
+    return await ctx.reply(text, options);
+  } catch (err) {
+    if (!String(err?.message || '').includes('message is too long')) throw err;
+
+    const parts = splitMessageText(text);
+    for (let i = 0; i < parts.length; i++) {
+      const isLast = i === parts.length - 1;
+      await ctx.reply(parts[i], {
+        ...options,
+        reply_markup: isLast ? options.reply_markup : undefined
+      });
+    }
+  }
+}
+
 async function sendScheduleToUser(ctx, target, startDate, endDate, viewType = 'today') {
   const statusMsg = await ctx.reply('Загрузка расписания...');
 
   try {
     const scheduleResult = await getSchedule(target, startDate, endDate);
-    const messages = formatScheduleMessages(scheduleResult);
+    const messages = formatScheduleMessages(scheduleResult, { maxAuditoriumGroups: Infinity });
 
     await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
 
     for (let i = 0; i < messages.length; i++) {
       const isLast = i === messages.length - 1;
-      await ctx.reply(messages[i], {
+      await replyChunked(ctx, messages[i], {
         parse_mode: 'HTML',
         reply_markup: isLast ? getScheduleInlineKeyboard(target, viewType) : undefined
       });
@@ -131,6 +149,22 @@ async function sendScheduleToUser(ctx, target, startDate, endDate, viewType = 't
 
 bot.command('start', async (ctx) => {
   await storage.init();
+
+  const payload = typeof ctx.match === 'string' ? ctx.match.trim() : '';
+  const schedulePayload = payload.match(/^([tw])_([a-f0-9]{12})$/);
+  if (schedulePayload) {
+    const ref = resolveRef(schedulePayload[2]);
+    if (ref?.kind === 'target') {
+      pending.clear(ctx.from.id);
+      if (schedulePayload[1] === 'w') {
+        const range = getWeekRange(new Date(), 0);
+        return sendScheduleToUser(ctx, ref.value, range.start, range.finish, 'thisweek');
+      }
+      const today = getTodayDate();
+      return sendScheduleToUser(ctx, ref.value, today, today, 'today');
+    }
+  }
+
   const user = storage.getUser(ctx.from.id);
 
   if (user?.target) {
@@ -179,7 +213,7 @@ bot.callbackQuery(/^view:(today|tomorrow|thisweek|nextweek):(.+)$/, async (ctx) 
 
   try {
     const scheduleResult = await getSchedule(target, startDate, endDate);
-    const messages = formatScheduleMessages(scheduleResult);
+    const messages = formatScheduleMessages(scheduleResult, { maxAuditoriumGroups: Infinity });
 
     await ctx.answerCallbackQuery();
 
@@ -290,6 +324,27 @@ bot.on('callback_query:data', async (ctx) => {
   }
 });
 
+function getInlineStartUrl(ctx, viewType, target) {
+  const username = ctx.me?.username || bot.botInfo?.username;
+  if (!username) return null;
+  const ref = makeRef('target', target);
+  if (!ref) return null;
+  const payload = `${viewType === 'week' ? 'w' : 't'}_${ref}`;
+  return `https://t.me/${username}?start=${encodeURIComponent(payload)}`;
+}
+
+function withInlineNotice(text, totalParts, targetType) {
+  const notes = [];
+  if (totalParts > 1) {
+    notes.push(`Показана часть 1 из ${totalParts}.`);
+  }
+  if (targetType === 'Auditorium') {
+    notes.push('Полный список групп — по кнопке ниже.');
+  }
+  if (notes.length === 0) return text;
+  return `${text}\n<i>${notes.join(' ')}</i>`;
+}
+
 bot.on('inline_query', async (ctx) => {
   await storage.init();
   await directoryCache.init();
@@ -328,31 +383,39 @@ bot.on('inline_query', async (ctx) => {
 
     try {
       const todaySched = await getSchedule(t.title, today, today);
-      const todayMsgs = formatScheduleMessages(todaySched);
+      const todayMsgs = formatScheduleMessages(todaySched, { maxAuditoriumGroups: 20 });
+      const todayUrl = getInlineStartUrl(ctx, 'today', t.title);
 
       results.push({
         type: 'article',
         id: crypto.createHash('md5').update(`today:${t.title}:${idx}`).digest('hex'),
         title: `${labelPrefix}${targetTitle} — сегодня`,
-        description: `Расписание на ${today}`,
+        description: `Расписание на ${today}${todayMsgs.length > 1 ? ` · частей: ${todayMsgs.length}` : ''}`,
         input_message_content: {
-          message_text: todayMsgs[0],
+          message_text: withInlineNotice(todayMsgs[0], todayMsgs.length, todaySched.targetType),
           parse_mode: 'HTML'
-        }
+        },
+        reply_markup: todayUrl
+          ? { inline_keyboard: [[{ text: 'Полное расписание в боте', url: todayUrl }]] }
+          : undefined
       });
 
       const weekSched = await getSchedule(t.title, week.start, week.finish);
-      const weekMsgs = formatScheduleMessages(weekSched);
+      const weekMsgs = formatScheduleMessages(weekSched, { maxAuditoriumGroups: 20 });
+      const weekUrl = getInlineStartUrl(ctx, 'week', t.title);
 
       results.push({
         type: 'article',
         id: crypto.createHash('md5').update(`week:${t.title}:${idx}`).digest('hex'),
         title: `${labelPrefix}${targetTitle} — неделя`,
-        description: `${week.start} — ${week.finish}`,
+        description: `${week.start} — ${week.finish}${weekMsgs.length > 1 ? ` · частей: ${weekMsgs.length}` : ''}`,
         input_message_content: {
-          message_text: weekMsgs[0],
+          message_text: withInlineNotice(weekMsgs[0], weekMsgs.length, weekSched.targetType),
           parse_mode: 'HTML'
-        }
+        },
+        reply_markup: weekUrl
+          ? { inline_keyboard: [[{ text: 'Полное расписание в боте', url: weekUrl }]] }
+          : undefined
       });
     } catch (err) {
       if (err instanceof ScheduleSourceError) {

@@ -10,6 +10,8 @@ import { refreshDirectoryIfNeeded } from './crawler.js';
 
 const MOBILE_API_BASE = 'http://services.niu.ranepa.ru/API/public';
 
+export const MAX_MESSAGE_LENGTH = 3500;
+
 export const WEEKDAYS = [
   'Воскресенье',
   'Понедельник',
@@ -339,9 +341,60 @@ export function formatDayHeader(dateStr) {
   return `<b>${dayName}, ${day} ${monthName}</b>`;
 }
 
-export function formatDayLessonsHtml(dayData, targetType = 'Group') {
-  let text = `${formatDayHeader(dayData.date)}\n`;
-  text += `────────────────────\n`;
+const MAX_AUDITORIUM_GROUPS = 20;
+
+export function formatAuditoriumGroups(group, limit = MAX_AUDITORIUM_GROUPS) {
+  const groups = String(group)
+    .split(/[,;]\s*/)
+    .map(item => item.trim())
+    .filter(Boolean);
+
+  if (groups.length === 0) return '';
+  if (groups.length <= limit) {
+    return groups.map(escapeHtml).join(', ');
+  }
+
+  const shown = groups.slice(0, limit).map(escapeHtml).join(', ');
+  const rest = groups.length - limit;
+  return `${shown}, и ещё ${rest} групп`;
+}
+
+export function formatLessonBlock(lesson, index, targetType = 'Group', options = {}) {
+  const { maxAuditoriumGroups = MAX_AUDITORIUM_GROUPS } = options;
+  const num = index + 1;
+  let text = `${num}. <code>${lesson.startTime} - ${lesson.endTime}</code>`;
+  if (targetType !== 'Auditorium' && lesson.auditorium) {
+    text += ` | Ауд. <b>${escapeHtml(lesson.auditorium)}</b>`;
+  }
+  text += `\n`;
+
+  text += `<b>${escapeHtml(lesson.subject)}</b>\n`;
+  if (lesson.type) {
+    text += `<i>${escapeHtml(formatLessonType(lesson.type))}</i>\n`;
+  }
+  if (targetType === 'Auditorium') {
+    if (lesson.group) text += `Группа: ${formatAuditoriumGroups(lesson.group, maxAuditoriumGroups)}\n`;
+    if (lesson.teacher) text += `Преподаватель: ${escapeHtml(lesson.teacher)}\n`;
+  } else if (targetType === 'Group' && lesson.teacher) {
+    text += `Преподаватель: ${escapeHtml(lesson.teacher)}\n`;
+  } else if (targetType === 'Prep' && lesson.group) {
+    text += `Группа: ${escapeHtml(lesson.group)}\n`;
+  }
+
+  if (lesson.changeNote) {
+    text += `Внимание: <i>${escapeHtml(lesson.changeNote)}</i>\n`;
+  }
+  text += `\n`;
+
+  return text;
+}
+
+function formatDaySeparator(dayData) {
+  return `${formatDayHeader(dayData.date)}\n────────────────────\n`;
+}
+
+export function formatDayLessonsHtml(dayData, targetType = 'Group', options = {}) {
+  let text = formatDaySeparator(dayData);
 
   if (!dayData.lessons || dayData.lessons.length === 0) {
     text += `<i>Занятий нет.</i>\n\n`;
@@ -349,38 +402,90 @@ export function formatDayLessonsHtml(dayData, targetType = 'Group') {
   }
 
   for (let i = 0; i < dayData.lessons.length; i++) {
-    const l = dayData.lessons[i];
-    const num = i + 1;
-    text += `${num}. <code>${l.startTime} - ${l.endTime}</code>`;
-    if (targetType !== 'Auditorium' && l.auditorium) {
-      text += ` | Ауд. <b>${escapeHtml(l.auditorium)}</b>`;
-    }
-    text += `\n`;
-
-    text += `<b>${escapeHtml(l.subject)}</b>\n`;
-    if (l.type) {
-      text += `<i>${escapeHtml(formatLessonType(l.type))}</i>\n`;
-    }
-    if (targetType === 'Auditorium') {
-      if (l.group) text += `Группа: ${escapeHtml(l.group)}\n`;
-      if (l.teacher) text += `Преподаватель: ${escapeHtml(l.teacher)}\n`;
-    } else if (targetType === 'Group' && l.teacher) {
-      text += `Преподаватель: ${escapeHtml(l.teacher)}\n`;
-    } else if (targetType === 'Prep' && l.group) {
-      text += `Группа: ${escapeHtml(l.group)}\n`;
-    }
-
-    if (l.changeNote) {
-      text += `Внимание: <i>${escapeHtml(l.changeNote)}</i>\n`;
-    }
-    text += `\n`;
+    text += formatLessonBlock(dayData.lessons[i], i, targetType, options);
   }
 
   return text;
 }
 
-export function formatScheduleMessages(scheduleResult) {
+function findSafeCut(text, limit) {
+  const newlineCut = text.lastIndexOf('\n', limit);
+  if (newlineCut > 0) return newlineCut + 1;
+
+  let cut = Math.min(limit, text.length);
+
+  const lastOpen = text.lastIndexOf('<', cut);
+  const lastClose = text.lastIndexOf('>', cut - 1);
+  if (lastOpen > lastClose) cut = lastOpen;
+
+  const lastAmp = text.lastIndexOf('&', cut);
+  const lastSemi = text.lastIndexOf(';', cut - 1);
+  if (lastAmp > lastSemi && cut - lastAmp <= 10) cut = lastAmp;
+
+  return cut > 0 ? cut : Math.min(limit, text.length);
+}
+
+const TAG_BALANCE_MARGIN = 32;
+
+function getOpenTags(text) {
+  const stack = [];
+  const re = /<(\/?)(b|i|code)>/g;
+  let match;
+  while ((match = re.exec(text)) !== null) {
+    if (match[1] === '/') {
+      const idx = stack.lastIndexOf(match[2]);
+      if (idx >= 0) stack.length = idx;
+    } else {
+      stack.push(match[2]);
+    }
+  }
+  return stack;
+}
+
+function closeTags(stack) {
+  let suffix = '';
+  for (let i = stack.length - 1; i >= 0; i--) {
+    suffix += `</${stack[i]}>`;
+  }
+  return suffix;
+}
+
+function openTags(stack) {
+  let prefix = '';
+  for (const tag of stack) {
+    prefix += `<${tag}>`;
+  }
+  return prefix;
+}
+
+export function splitMessageText(text, limit = MAX_MESSAGE_LENGTH) {
+  const source = String(text);
+  const max = Math.max(1, limit);
+  if (source.length <= max) return [source];
+
+  const parts = [];
+  let rest = source;
+  let carry = '';
+
+  while (rest.length + carry.length > max) {
+    const budget = Math.max(1, max - carry.length - TAG_BALANCE_MARGIN);
+    const cut = findSafeCut(rest, budget);
+    const body = rest.slice(0, cut);
+    rest = rest.slice(cut);
+
+    const piece = carry + body;
+    const stack = getOpenTags(piece);
+    parts.push(piece + closeTags(stack));
+    carry = openTags(stack);
+  }
+
+  if (rest.length > 0) parts.push(carry + rest);
+  return parts;
+}
+
+export function formatScheduleMessages(scheduleResult, options = {}) {
   const { target, targetType, startDate, endDate, totalLessons, days } = scheduleResult;
+  const { maxAuditoriumGroups = MAX_AUDITORIUM_GROUPS } = options;
   const isRange = startDate !== endDate;
 
   let titleHeader = '';
@@ -407,20 +512,57 @@ export function formatScheduleMessages(scheduleResult) {
   const messages = [];
   let currentChunk = titleHeader;
 
-  for (const day of days) {
-    const dayText = formatDayLessonsHtml(day, targetType);
+  const flushChunk = () => {
+    const text = currentChunk.trim();
+    if (text.length > 0) messages.push(text);
+  };
 
-    if (currentChunk.length + dayText.length > 3500 && currentChunk.length > titleHeader.length) {
-      messages.push(currentChunk.trim());
-      currentChunk = dayText;
-    } else {
-      currentChunk += dayText;
+  for (const day of days) {
+    const dayHeader = formatDaySeparator(day);
+    const chunkPrefix = titleHeader + dayHeader;
+
+    if (currentChunk.length > titleHeader.length &&
+        currentChunk.length + dayHeader.length > MAX_MESSAGE_LENGTH) {
+      flushChunk();
+      currentChunk = titleHeader;
+    }
+    currentChunk += dayHeader;
+
+    if (!day.lessons || day.lessons.length === 0) {
+      currentChunk += `<i>Занятий нет.</i>\n\n`;
+      continue;
+    }
+
+    for (let i = 0; i < day.lessons.length; i++) {
+      const block = formatLessonBlock(day.lessons[i], i, targetType, { maxAuditoriumGroups });
+
+      if (currentChunk.length + block.length <= MAX_MESSAGE_LENGTH) {
+        currentChunk += block;
+        continue;
+      }
+
+      if (currentChunk.length > chunkPrefix.length) {
+        flushChunk();
+        currentChunk = chunkPrefix;
+      }
+
+      if (currentChunk.length + block.length <= MAX_MESSAGE_LENGTH) {
+        currentChunk += block;
+        continue;
+      }
+
+      const pieces = splitMessageText(block, MAX_MESSAGE_LENGTH - chunkPrefix.length);
+      for (let j = 0; j < pieces.length; j++) {
+        if (j > 0) {
+          flushChunk();
+          currentChunk = chunkPrefix;
+        }
+        currentChunk += pieces[j];
+      }
     }
   }
 
-  if (currentChunk.trim().length > 0) {
-    messages.push(currentChunk.trim());
-  }
+  flushChunk();
 
   return messages;
 }
